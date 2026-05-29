@@ -96,4 +96,4 @@ Set `strip_boot_noise: false` and `strip_ansi: false` to get the raw bytes.
 
 ## License
 
-See repository.
+MIT — see [LICENSE](LICENSE).
