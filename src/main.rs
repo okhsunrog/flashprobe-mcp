@@ -143,6 +143,10 @@ struct MonitorInput {
     /// When stop_pattern matches, return only the matched line plus this many lines
     /// before it (and nothing after). Omit to keep all output up to the matched line.
     context_lines: Option<usize>,
+    /// Keep only lines matching this (unanchored) regex; everything else is dropped.
+    /// Applied after cleaning. Useful for full-log captures with no stop_pattern,
+    /// e.g. `filter: "ERROR|WARN"` or `filter: "RESULT|dropped"`.
+    filter: Option<String>,
     /// Discard any bytes buffered before monitoring starts (default: true). Prevents
     /// catching the tail of a previous run. Set false to keep already-buffered output.
     #[serde(default = "default_true")]
@@ -188,6 +192,8 @@ struct FlashMonitorInput {
     strip_ansi: bool,
     /// When stop_pattern matches, return only the matched line plus this many lines before it.
     context_lines: Option<usize>,
+    /// Keep only lines matching this (unanchored) regex; applied after cleaning.
+    filter: Option<String>,
     /// Cap on captured bytes; stops early and marks output truncated (default: 65536).
     #[serde(default = "default_max_bytes")]
     max_bytes: usize,
@@ -217,9 +223,21 @@ struct RerunInput {
     strip_ansi: bool,
     /// When stop_pattern matches, return only the matched line plus this many lines before it.
     context_lines: Option<usize>,
+    /// Keep only lines matching this (unanchored) regex; applied after cleaning.
+    filter: Option<String>,
     /// Cap on captured bytes; stops early and marks output truncated (default: 65536).
     #[serde(default = "default_max_bytes")]
     max_bytes: usize,
+    /// Number of reset+monitor cycles to run back-to-back (default: 1, max: 50).
+    /// With repeat > 1 the result is compact: one line per run (the matched line if
+    /// stop_pattern is set, else the last line) plus a summary counting how many runs
+    /// matched. Ideal for characterizing intermittent/flaky bugs in one call.
+    #[serde(default = "default_repeat")]
+    repeat: usize,
+}
+
+fn default_repeat() -> usize {
+    1
 }
 
 fn default_baud() -> u32 {
@@ -427,7 +445,43 @@ fn trim_to_match(text: &str, re: &Regex, context_lines: Option<usize>) -> Option
     Some(lines[start_line..=match_line].join("\n"))
 }
 
-/// Apply boot-noise stripping, ANSI stripping, and match focusing to a raw capture.
+/// Compile an optional user-supplied regex, mapping errors to a readable message.
+fn compile_opt_regex(pattern: Option<&str>) -> Result<Option<Regex>, String> {
+    pattern
+        .map(|p| Regex::new(p).map_err(|e| format!("Invalid regex pattern: {e}")))
+        .transpose()
+}
+
+/// Keep only the lines of `text` that match `filter`.
+fn filter_lines(text: &str, filter: &Regex) -> String {
+    text.lines()
+        .filter(|l| filter.is_match(l))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The last non-empty (trimmed) line of `text`, or "(no output)" if there is none.
+/// Used for compact per-run summaries.
+fn last_nonempty_line(text: &str) -> String {
+    text.lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("(no output)")
+        .to_string()
+}
+
+/// Char-safe truncation for compact one-line summaries.
+fn truncate_line(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(max).collect();
+    format!("{head}\u{2026} [+{} chars]", s.chars().count() - max)
+}
+
+/// Apply boot-noise stripping, ANSI stripping, match focusing, and line filtering
+/// to a raw capture, in that order.
 fn process_capture(
     raw: &str,
     strip_boot_noise_opt: bool,
@@ -435,6 +489,7 @@ fn process_capture(
     stop_re: Option<&Regex>,
     matched: bool,
     context_lines: Option<usize>,
+    filter: Option<&Regex>,
 ) -> String {
     let mut text = if strip_ansi_opt {
         strip_ansi(raw)
@@ -451,6 +506,9 @@ fn process_capture(
         && let Some(focused) = trim_to_match(&text, re, context_lines)
     {
         text = focused;
+    }
+    if let Some(f) = filter {
+        text = filter_lines(&text, f);
     }
     text
 }
@@ -576,6 +634,7 @@ fn read_serial_output(
 }
 
 /// Format a captured monitor result into the displayed serial-output block.
+#[allow(clippy::too_many_arguments)]
 fn render_capture(
     port: &str,
     baud: u32,
@@ -584,6 +643,7 @@ fn render_capture(
     strip_ansi_opt: bool,
     stop_re: Option<&Regex>,
     context_lines: Option<usize>,
+    filter: Option<&Regex>,
 ) -> String {
     let processed = process_capture(
         &raw.output,
@@ -592,6 +652,7 @@ fn render_capture(
         stop_re,
         raw.matched,
         context_lines,
+        filter,
     );
 
     let mut header = format!(
@@ -926,11 +987,8 @@ impl EspflashServer {
         rmcp::handler::server::wrapper::Parameters(input): rmcp::handler::server::wrapper::Parameters<MonitorInput>,
     ) -> Result<CallToolResult, McpError> {
         let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
-            let stop_re = input
-                .stop_pattern
-                .as_deref()
-                .map(|p| Regex::new(p).map_err(|e| format!("Invalid regex pattern: {e}")))
-                .transpose()?;
+            let stop_re = compile_opt_regex(input.stop_pattern.as_deref())?;
+            let filter_re = compile_opt_regex(input.filter.as_deref())?;
 
             let monitor = read_serial_output(
                 &input.port,
@@ -950,6 +1008,7 @@ impl EspflashServer {
                 input.strip_ansi,
                 stop_re.as_ref(),
                 input.context_lines,
+                filter_re.as_ref(),
             );
 
             Ok(format!("## Serial Monitor Output\n\n{block}"))
@@ -1017,11 +1076,8 @@ impl EspflashServer {
             std::thread::sleep(Duration::from_millis(100));
 
             // --- Monitor phase ---
-            let stop_re = input
-                .stop_pattern
-                .as_deref()
-                .map(|p| Regex::new(p).map_err(|e| format!("Invalid regex pattern: {e}")))
-                .transpose()?;
+            let stop_re = compile_opt_regex(input.stop_pattern.as_deref())?;
+            let filter_re = compile_opt_regex(input.filter.as_deref())?;
 
             let monitor = read_serial_output(
                 &input.port,
@@ -1041,6 +1097,7 @@ impl EspflashServer {
                 input.strip_ansi,
                 stop_re.as_ref(),
                 input.context_lines,
+                filter_re.as_ref(),
             );
 
             Ok(format!(
@@ -1055,52 +1112,95 @@ impl EspflashServer {
     }
 
     #[tool(
-        description = "Re-run the firmware already on the device: hardware reset (DTR/RTS), flush the buffer, then monitor the fresh boot. One call instead of reset_device + monitor; ideal for iterating on the same binary without reflashing. ROM/bootloader noise and ANSI codes are stripped by default, and on a stop_pattern match the output is focused on the matched line."
+        description = "Re-run the firmware already on the device: hardware reset (DTR/RTS), flush the buffer, then monitor the fresh boot. One call instead of reset_device + monitor; ideal for iterating on the same binary without reflashing. Set repeat > 1 to run N cycles back-to-back and get a compact per-run summary (one matched line per run + a match count) - useful for characterizing flaky/intermittent bugs. ROM/bootloader noise and ANSI codes are stripped by default, and on a stop_pattern match the output is focused on the matched line."
     )]
     async fn rerun(
         &self,
         rmcp::handler::server::wrapper::Parameters(input): rmcp::handler::server::wrapper::Parameters<RerunInput>,
     ) -> Result<CallToolResult, McpError> {
         let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
-            let stop_re = input
-                .stop_pattern
-                .as_deref()
-                .map(|p| Regex::new(p).map_err(|e| format!("Invalid regex pattern: {e}")))
-                .transpose()?;
+            let stop_re = compile_opt_regex(input.stop_pattern.as_deref())?;
+            let filter_re = compile_opt_regex(input.filter.as_deref())?;
+            let repeat = input.repeat.clamp(1, 50);
 
-            // --- Reset phase (no stub, matches reset_device / espflash CLI) ---
-            let mut flasher = connect_to_device(&input.port, 115_200, false)?;
-            flasher
-                .connection()
-                .reset()
-                .map_err(|e| format!("Failed to reset device: {e}"))?;
-            drop(flasher);
+            // One reset (no stub, matches reset_device / espflash CLI) + flush + monitor.
+            let one_cycle = || -> Result<MonitorResult, String> {
+                let mut flasher = connect_to_device(&input.port, 115_200, false)?;
+                flasher
+                    .connection()
+                    .reset()
+                    .map_err(|e| format!("Failed to reset device: {e}"))?;
+                drop(flasher);
+                // Let the ROM bootloader start before we open the monitor.
+                std::thread::sleep(Duration::from_millis(100));
+                read_serial_output(
+                    &input.port,
+                    input.baud,
+                    Duration::from_secs_f64(input.timeout_secs),
+                    Duration::from_millis(input.idle_timeout_ms),
+                    stop_re.as_ref(),
+                    true, // flush: start each capture clean
+                    input.max_bytes,
+                )
+            };
 
-            // Let the ROM bootloader start before we open the monitor.
-            std::thread::sleep(Duration::from_millis(100));
+            if repeat == 1 {
+                let monitor = one_cycle()?;
+                let block = render_capture(
+                    &input.port,
+                    input.baud,
+                    &monitor,
+                    input.strip_boot_noise,
+                    input.strip_ansi,
+                    stop_re.as_ref(),
+                    input.context_lines,
+                    filter_re.as_ref(),
+                );
+                return Ok(format!("## Rerun (reset + monitor)\n\n{block}"));
+            }
 
-            // --- Monitor phase (flush drops connect/download-mode noise) ---
-            let monitor = read_serial_output(
-                &input.port,
-                input.baud,
-                Duration::from_secs_f64(input.timeout_secs),
-                Duration::from_millis(input.idle_timeout_ms),
-                stop_re.as_ref(),
-                true, // flush: start the capture clean
-                input.max_bytes,
-            )?;
+            // repeat > 1: compact summary, one line per run.
+            let mut matched_count = 0usize;
+            let mut rows = String::new();
+            for i in 1..=repeat {
+                let mr = one_cycle()?;
+                if mr.matched {
+                    matched_count += 1;
+                }
+                let summary = if mr.matched && stop_re.is_some() {
+                    // Focus to just the matched line (ignore filter for the summary).
+                    process_capture(
+                        &mr.output,
+                        input.strip_boot_noise,
+                        input.strip_ansi,
+                        stop_re.as_ref(),
+                        true,
+                        Some(0),
+                        None,
+                    )
+                } else {
+                    let clean = process_capture(
+                        &mr.output,
+                        input.strip_boot_noise,
+                        input.strip_ansi,
+                        None,
+                        false,
+                        None,
+                        filter_re.as_ref(),
+                    );
+                    last_nonempty_line(&clean)
+                };
+                let tag = if mr.matched { "match" } else { mr.stop_reason };
+                rows.push_str(&format!("{i:>2}. [{tag}] {}\n", truncate_line(&summary, 200)));
+            }
 
-            let block = render_capture(
-                &input.port,
-                input.baud,
-                &monitor,
-                input.strip_boot_noise,
-                input.strip_ansi,
-                stop_re.as_ref(),
-                input.context_lines,
+            let header = format!(
+                "## Rerun \u{00d7}{repeat} (reset + monitor)\n\n\
+                 Port: {} @ {} baud\n\
+                 stop_pattern matched in {}/{} runs",
+                input.port, input.baud, matched_count, repeat
             );
-
-            Ok(format!("## Rerun (reset + monitor)\n\n{block}"))
+            Ok(format!("{header}\n\n```\n{rows}```"))
         })
         .await
         .map_err(|e| McpError::internal_error(e.to_string(), None))?
@@ -1237,7 +1337,7 @@ mod tests {
     #[test]
     fn process_capture_full_pipeline() {
         let raw = sample_capture();
-        let out = process_capture(&raw, true, true, None, false, None);
+        let out = process_capture(&raw, true, true, None, false, None, None);
         assert!(out.starts_with("INFO - Embassy initialized!"));
         assert!(!out.contains("esp_image"));
         assert!(!out.contains('\u{FFFD}'));
@@ -1265,8 +1365,31 @@ mod tests {
         let mut raw = sample_capture();
         raw.push_str("rst:0x1 (POWERON_RESET)\n\u{FFFD}\u{FFFD}garbage reboot\n");
         let re = Regex::new("RESULT (PASS|FAIL)").unwrap();
-        let out = process_capture(&raw, true, true, Some(&re), true, Some(0));
+        let out = process_capture(&raw, true, true, Some(&re), true, Some(0), None);
         assert_eq!(out, "INFO - RESULT PASS (100/100)");
+    }
+
+    #[test]
+    fn filter_keeps_only_matching_lines() {
+        let text = "INFO - a\nERROR - boom\nINFO - b\nWARN - hmm";
+        let re = Regex::new("ERROR|WARN").unwrap();
+        assert_eq!(filter_lines(text, &re), "ERROR - boom\nWARN - hmm");
+    }
+
+    #[test]
+    fn process_capture_applies_filter() {
+        let raw = sample_capture();
+        let re = Regex::new("RESULT").unwrap();
+        let out = process_capture(&raw, true, true, None, false, None, Some(&re));
+        assert_eq!(out, "INFO - RESULT PASS (100/100)");
+    }
+
+    #[test]
+    fn last_nonempty_and_truncate() {
+        assert_eq!(last_nonempty_line("a\nb\n\n  \n"), "b");
+        assert_eq!(last_nonempty_line("   \n"), "(no output)");
+        assert_eq!(truncate_line("short", 200), "short");
+        assert_eq!(truncate_line("abcdef", 3), "abc\u{2026} [+3 chars]");
     }
 
     #[test]
