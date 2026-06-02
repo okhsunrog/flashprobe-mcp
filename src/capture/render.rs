@@ -25,11 +25,12 @@ pub fn truncate_line(s: &str, max: usize) -> String {
     format!("{head}\u{2026} [+{} chars]", s.chars().count() - max)
 }
 
-/// Format a captured result into the displayed serial-output block.
+/// Format a captured result into the displayed serial-output block. `header_line`
+/// labels the source (e.g. `Port: /dev/ttyUSB0 @ 115200 baud` for serial, or
+/// `Probe: esp32c3 via RTT` for probe-rs).
 #[allow(clippy::too_many_arguments)]
 pub fn render_capture(
-    port: &str,
-    baud: u32,
+    header_line: &str,
     result: &CaptureResult,
     strip_boot_noise_opt: bool,
     strip_ansi_opt: bool,
@@ -49,9 +50,8 @@ pub fn render_capture(
     );
 
     let mut header = format!(
-        "Port: {} @ {} baud\nStopped: {}\nCaptured {} raw bytes",
-        port,
-        baud,
+        "{}\nStopped: {}\nCaptured {} raw bytes",
+        header_line,
         result.stop_reason.as_str(),
         result.raw_bytes
     );

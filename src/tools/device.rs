@@ -3,6 +3,7 @@
 //! `device_router`, combined with the capture tools in `server.rs`.
 
 use crate::backend::espflash::{connect_to_device, flash_file};
+use crate::backend::{BackendKind, parse_backend};
 use crate::inputs::*;
 use crate::server::EspflashServer;
 use rmcp::{
@@ -12,6 +13,9 @@ use rmcp::{
     tool, tool_router,
 };
 use serialport::SerialPortType;
+
+#[cfg(feature = "probe-rs")]
+use crate::backend::probers;
 
 #[tool_router(router = device_router, vis = "pub(crate)")]
 impl EspflashServer {
@@ -92,25 +96,40 @@ impl EspflashServer {
     }
 
     #[tool(
-        description = "Flash an ELF or raw binary file to an ESP device. For ELF files, the IDF bootloader format is used automatically. For raw binaries, provide a flash_address."
+        description = "Flash an ELF or raw binary file to a device. Backend: espflash (serial, default) or probe-rs (JTAG/SWD; pass `chip`). For espflash ELF files the IDF bootloader format is used automatically; for raw binaries provide a flash_address. probe-rs flashes ELF/IDF images."
     )]
     async fn flash(
         &self,
         Parameters(input): Parameters<FlashInput>,
     ) -> Result<CallToolResult, McpError> {
         let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
-            let file_data = std::fs::read(&input.file_path)
-                .map_err(|e| format!("Failed to read file '{}': {e}", input.file_path))?;
-
-            let mut flasher = connect_to_device(&input.port, input.baud, true)?;
-
-            let summary = flash_file(
-                &mut flasher,
-                &file_data,
-                input.flash_address,
-                input.partition_table.as_deref(),
-                input.bootloader.as_deref(),
-            )?;
+            let summary = match parse_backend(input.backend.as_deref())? {
+                BackendKind::Espflash => {
+                    let port = input
+                        .port
+                        .as_deref()
+                        .ok_or("backend=espflash requires `port`")?;
+                    let file_data = std::fs::read(&input.file_path)
+                        .map_err(|e| format!("Failed to read file '{}': {e}", input.file_path))?;
+                    let mut flasher = connect_to_device(port, input.baud, true)?;
+                    flash_file(
+                        &mut flasher,
+                        &file_data,
+                        input.flash_address,
+                        input.partition_table.as_deref(),
+                        input.bootloader.as_deref(),
+                    )?
+                }
+                #[cfg(feature = "probe-rs")]
+                BackendKind::ProbeRs => {
+                    let chip = input
+                        .chip
+                        .as_deref()
+                        .ok_or("backend=probe-rs requires `chip` (e.g. \"esp32c3\")")?;
+                    let mut session = probers::open_session(chip, input.probe.as_deref())?;
+                    probers::flash(&mut session, &input.file_path, chip)?
+                }
+            };
             Ok(format!("Successfully {}", lower_first(&summary)))
         })
         .await

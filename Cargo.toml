@@ -7,11 +7,18 @@ license = "MIT"
 [dependencies]
 anyhow = "1.0.102"
 espflash = { version = "4.3.0", default-features = false, features = ["serialport"] }
+probe-rs = { version = "0.31", optional = true }
 regex = "1.12.3"
 rmcp = { version = "0.16.0", features = ["server", "transport-io"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
-serialport = "4.8.1"
+serialport = { version = "4.9", features = ["usbportinfo-interface"] }
 tokio = { version = "1.49.0", features = ["full"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+
+[features]
+default = ["probe-rs"]
+# probe-rs backend (JTAG/SWD flashing + RTT). Heavy dep tree; disable with
+# --no-default-features for a lean espflash-only (serial) build.
+probe-rs = ["dep:probe-rs"]

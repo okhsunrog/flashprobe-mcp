@@ -27,6 +27,7 @@ pub fn connect_to_device(port_name: &str, baud: u32, use_stub: bool) -> Result<F
             serial_number: None,
             manufacturer: None,
             product: None,
+            interface: None,
         },
     };
 

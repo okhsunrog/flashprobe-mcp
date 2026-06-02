@@ -1,6 +1,11 @@
 //! Tool input types. Capture tools share a renamed field set (`stop`,
 //! `timeout_s`, `idle_ms`, `grep`, `context`); device tools are unchanged.
 
+// `chip`/`probe` are only consumed by the probe-rs backend. Without that feature
+// they stay in the schema (deserialized, then ignored) but are never read in
+// code, so suppress the dead-code lint for this espflash-only build.
+#![cfg_attr(not(feature = "probe-rs"), allow(dead_code))]
+
 use rmcp::schemars;
 use serde::Deserialize;
 
@@ -44,19 +49,26 @@ pub struct ChipInfoInput {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct FlashInput {
-    /// Serial port path
-    pub port: String,
+    /// Backend: "espflash" (serial, default) or "probe-rs" (JTAG/SWD).
+    pub backend: Option<String>,
+    /// Serial port path (required for the espflash backend).
+    pub port: Option<String>,
+    /// Chip/target name for the probe-rs backend, e.g. "esp32c3", "stm32g431cbtx".
+    pub chip: Option<String>,
+    /// probe-rs probe selector as VID:PID[:SERIAL] (hex). Omit if only one probe.
+    pub probe: Option<String>,
     /// Path to the ELF or binary file to flash
     pub file_path: String,
-    /// Baud rate for flashing (default: 460800)
+    /// Baud rate for flashing (default: 460800). espflash backend only.
     #[serde(default = "default_baud")]
     pub baud: u32,
     /// Flash address for raw binary files (hex or decimal). If omitted, the file
     /// is treated as an ELF and processed through the IDF bootloader format.
+    /// espflash backend only (probe-rs flashes ELF/IDF images).
     pub flash_address: Option<u32>,
-    /// Path to a custom partition table CSV or binary file
+    /// Path to a custom partition table CSV or binary file (espflash backend).
     pub partition_table: Option<String>,
-    /// Path to a custom bootloader binary file
+    /// Path to a custom bootloader binary file (espflash backend).
     pub bootloader: Option<String>,
 }
 
@@ -120,9 +132,16 @@ pub struct ChecksumMd5Input {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct MonitorInput {
-    /// Serial port path
-    pub port: String,
-    /// Baud rate for serial monitoring (default: 115200, the ESP-IDF default)
+    /// Backend: "espflash" (serial, default) or "probe-rs" (RTT over JTAG/SWD).
+    pub backend: Option<String>,
+    /// Serial port path (required for the espflash backend).
+    pub port: Option<String>,
+    /// Chip/target name for the probe-rs backend, e.g. "esp32c3", "stm32g431cbtx".
+    pub chip: Option<String>,
+    /// probe-rs probe selector as VID:PID[:SERIAL] (hex). Omit if only one probe.
+    pub probe: Option<String>,
+    /// Baud rate for serial monitoring (default: 115200, the ESP-IDF default).
+    /// espflash backend only.
     #[serde(default = "default_monitor_baud")]
     pub baud: u32,
     /// Maximum time to monitor in seconds (default: 5)
@@ -164,14 +183,21 @@ pub struct MonitorInput {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct FlashMonitorInput {
-    /// Serial port path
-    pub port: String,
+    /// Backend: "espflash" (serial, default) or "probe-rs" (flash + RTT).
+    pub backend: Option<String>,
+    /// Serial port path (required for the espflash backend).
+    pub port: Option<String>,
+    /// Chip/target name for the probe-rs backend, e.g. "esp32c3", "stm32g431cbtx".
+    pub chip: Option<String>,
+    /// probe-rs probe selector as VID:PID[:SERIAL] (hex). Omit if only one probe.
+    pub probe: Option<String>,
     /// Path to the ELF or binary file to flash
     pub file_path: String,
-    /// Baud rate for flashing (default: 460800)
+    /// Baud rate for flashing (default: 460800). espflash backend only.
     #[serde(default = "default_baud")]
     pub flash_baud: u32,
-    /// Baud rate for serial monitoring after flash (default: 115200)
+    /// Baud rate for serial monitoring after flash (default: 115200).
+    /// espflash backend only.
     #[serde(default = "default_monitor_baud")]
     pub monitor_baud: u32,
     /// Flash address for raw binary files. If omitted, ELF format is assumed.
@@ -206,9 +232,15 @@ pub struct FlashMonitorInput {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RerunInput {
-    /// Serial port path
-    pub port: String,
-    /// Baud rate for serial monitoring (default: 115200)
+    /// Backend: "espflash" (serial, default) or "probe-rs" (reset + RTT).
+    pub backend: Option<String>,
+    /// Serial port path (required for the espflash backend).
+    pub port: Option<String>,
+    /// Chip/target name for the probe-rs backend, e.g. "esp32c3", "stm32g431cbtx".
+    pub chip: Option<String>,
+    /// probe-rs probe selector as VID:PID[:SERIAL] (hex). Omit if only one probe.
+    pub probe: Option<String>,
+    /// Baud rate for serial monitoring (default: 115200). espflash backend only.
     #[serde(default = "default_monitor_baud")]
     pub baud: u32,
     /// Maximum time to monitor in seconds (default: 5)
