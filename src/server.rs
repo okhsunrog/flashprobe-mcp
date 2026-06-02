@@ -10,11 +10,11 @@ use rmcp::{
 };
 
 #[derive(Clone)]
-pub struct EspflashServer {
+pub struct Server {
     tool_router: ToolRouter<Self>,
 }
 
-impl EspflashServer {
+impl Server {
     pub fn new() -> Self {
         Self {
             // Combine the per-module routers (see tools::device / tools::monitor).
@@ -24,7 +24,7 @@ impl EspflashServer {
 }
 
 #[tool_handler]
-impl ServerHandler for EspflashServer {
+impl ServerHandler for Server {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             protocol_version: ProtocolVersion::V_2024_11_05,
@@ -35,32 +35,35 @@ impl ServerHandler for EspflashServer {
                 ..Default::default()
             },
             instructions: Some(
-                "ESP device flash tool. Connect to ESP32/ESP32-S2/S3/C2/C3/C5/C6/H2/P4 \
-                 devices via serial port for flashing, erasing, and reading flash memory.\n\n\
+                "Flash + monitor embedded targets: ESP (Xtensa + RISC-V) and ARM \
+                 (STM32/nRF/RP2350/…), over two backends.\n\n\
+                 ## Backend (required)\n\
+                 Every flash/monitor call needs `backend`:\n\
+                 - \"probe-rs\": JTAG/SWD flashing + RTT capture. Use for firmware that \
+                   logs over RTT (defmt-rtt / rtt-target), and for all non-ESP chips.\n\
+                 - \"espflash\": UART flashing + serial capture. Use for firmware that \
+                   logs over UART (esp-println). ESP only.\n\
+                 Both work on ESP chips; pick the one matching where the firmware emits \
+                 output (else you'll see no logs). It is not auto-detected.\n\n\
+                 ## Auto-detection (override any per call)\n\
+                 - elf / file to flash: the build artifact, via `cargo metadata` (pass \
+                   `project_dir` if the server's cwd isn't the project; `bin` for \
+                   multi-binary workspaces).\n\
+                 - chip (probe-rs): from .cargo/config.toml's runner --chip.\n\
+                 - port (espflash): the sole USB serial port.\n\
+                 - defmt vs text: from the ELF's `.defmt` section (reliable).\n\n\
                  ## Tools\n\
-                 - list_ports: Discover available serial ports\n\
-                 - chip_info: Get device type, revision, MAC, flash size\n\
-                 - flash: Flash ELF or raw binary firmware\n\
-                 - flash_monitor: Flash firmware then capture boot serial output\n\
-                 - rerun: Reset the device and monitor the fresh boot (no reflash)\n\
-                 - monitor: Read serial output with timeout/pattern stop\n\
-                 - erase_flash: Erase entire flash (destructive)\n\
-                 - erase_region: Erase specific flash region (destructive)\n\
-                 - read_flash: Read flash contents to file\n\
-                 - reset_device: Hardware reset the device\n\
-                 - checksum_md5: Compute MD5 of flash region\n\n\
-                 All tools that communicate with a device require a serial port path. \
-                 Use list_ports first to discover available ports.\n\n\
-                 ## Monitoring\n\
-                 monitor, flash_monitor, and rerun stop when: max timeout reached, \
-                 a regex `stop` matches (substring/unanchored, alternation OK), \
-                 idle_ms passes with no new data, or the byte cap is reached. \
-                 By default they strip ROM baud-mismatch garbage + ESP-IDF bootloader \
-                 log lines (strip_boot_noise) and ANSI color codes (strip_ansi), and on \
-                 a `stop` match they focus output on the matched line (set \
-                 context for N preceding lines). Defaults: 5s timeout, 4s idle.\n\n\
-                 For iterating on the same firmware, prefer rerun over reset_device + \
-                 monitor. flash_monitor captures from boot (it does not flush)."
+                 - flash: flash firmware (no monitor)\n\
+                 - flash_monitor: flash, then capture from boot\n\
+                 - rerun: reset + capture (no reflash); repeat>1 for flaky-bug runs\n\
+                 - monitor: attach + capture only\n\
+                 - chip_info / erase_flash / erase_region / read_flash / reset_device / \
+                   checksum_md5 / list_ports (espflash/serial)\n\n\
+                 ## Capture\n\
+                 Stops on: `stop` regex match, `stop_on_level` (defmt), idle_ms, max \
+                 timeout, or byte cap. Provide an ELF (or let it auto-detect) to decode \
+                 defmt — then `level`/`module` filter structurally and a suppressed \
+                 count reports what was hidden. Text mode strips boot noise + ANSI."
                     .into(),
             ),
         }

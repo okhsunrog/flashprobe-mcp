@@ -1,98 +1,130 @@
-# espflash-mcp
+# flashprobe-mcp
 
-An [MCP](https://modelcontextprotocol.io) server that wraps
-[espflash](https://crates.io/crates/espflash) to flash, erase, read, and monitor
-ESP32-family devices over a serial port — from any MCP client (Claude Code,
-Claude Desktop, etc.).
+An [MCP](https://modelcontextprotocol.io) server for flashing and monitoring
+embedded targets from any MCP client (Claude Code, Claude Desktop, …). It covers
+the whole bench from one tool surface, over two backends:
 
-Supported chips: ESP32, ESP32-S2/S3, ESP32-C2/C3/C5/C6, ESP32-H2, ESP32-P4.
+- **probe-rs** — JTAG/SWD flashing + **RTT** capture. Any
+  [probe-rs-supported](https://probe.rs/targets/) chip: ESP (Xtensa + RISC-V),
+  STM32, nRF, RP2040/RP2350, …
+- **espflash** — UART flashing + serial capture for ESP32-family chips.
 
-The serial monitor is tuned for **LLM context efficiency**: by default captures
-are cleaned so only the application output reaches the model — the ROM
-baud-mismatch garbage, ESP-IDF bootloader log lines, and ANSI color codes are
-stripped, and on a pattern match the output is focused on the matched line.
+Output is decoded as **defmt** when the firmware uses it (`defmt-rtt`,
+`rtt-target`, or `esp-println`'s `defmt-espflash`) and plain text otherwise —
+detected automatically from the ELF.
+
+## Why a server instead of the CLI
+
+The win for an agent is **bounded, early-exiting capture**. `probe-rs run` /
+`espflash monitor` never terminate on their own — an agent either forgets a
+timeout and hangs, or sets one and burns the whole window every time. This
+server stops the instant an expected line (or defmt error) appears — the
+programmatic equivalent of watching the log and pressing Ctrl-C — and returns a
+compact, cleaned result.
 
 ## Build
 
 ```sh
 cargo build --release
-# binary at: target/release/espflash-mcp
+# binary at: target/release/flashprobe-mcp
+```
+
+probe-rs is a default-on feature. For a lean espflash-only (serial) build with a
+much smaller dependency tree:
+
+```sh
+cargo build --release --no-default-features
 ```
 
 The server speaks MCP over stdio.
 
 ## Configure your MCP client
 
-### Claude Code
-
 ```sh
-claude mcp add espflash -- /absolute/path/to/espflash-mcp/target/release/espflash-mcp
+claude mcp add flashprobe -- /absolute/path/to/target/release/flashprobe-mcp
 ```
 
-### Generic (`mcpServers` JSON)
+Or generic `mcpServers` JSON:
 
 ```json
 {
   "mcpServers": {
-    "espflash": {
-      "command": "/absolute/path/to/espflash-mcp/target/release/espflash-mcp"
+    "flashprobe": {
+      "command": "/absolute/path/to/target/release/flashprobe-mcp"
     }
   }
 }
 ```
 
-Serial access usually needs your user in the `dialout` (or `uucp`) group.
+Serial access needs your user in the `dialout`/`uucp` group; probe access needs
+the [probe-rs udev rules](https://probe.rs/docs/getting-started/probe-setup/).
+
+## Choosing a backend (required)
+
+Every flash/monitor call takes an explicit **`backend`**: `"probe-rs"` or
+`"espflash"`. Both work on ESP chips, and the right one depends on **where the
+firmware emits output** — RTT (probe-rs) vs UART (espflash). Picking the wrong
+one flashes fine but shows no logs, so the server asks rather than guessing.
+
+- defmt-rtt / rtt-target firmware → `probe-rs`
+- esp-println / UART firmware → `espflash`
+- any non-ESP chip → `probe-rs`
+
+## Auto-detection
+
+Everything except the backend is derived from the project on disk (no config
+file, no state) and can be overridden per call:
+
+| Derived | From | Override |
+|---------|------|----------|
+| ELF / file to flash | `cargo metadata` build artifact | `file_path` / `elf`, `project_dir`, `bin` |
+| chip (probe-rs) | `.cargo/config.toml` runner `--chip` | `chip` |
+| serial port (espflash) | the sole USB serial port | `port` |
+| defmt vs text | the ELF's `.defmt` section | — (reliable) |
+
+So from a project directory, `flash_monitor { "backend": "probe-rs", "stop":
+"ready" }` flashes the built artifact to the detected chip and decodes defmt —
+nothing else to pass.
 
 ## Tools
 
 | Tool | Purpose |
 |------|---------|
-| `list_ports` | Discover serial ports (with USB VID/PID) |
-| `chip_info` | Chip type, revision, MAC, crystal freq, flash size, features |
-| `flash` | Flash an ELF (IDF bootloader format) or a raw binary at an address |
-| `flash_monitor` | Flash, then capture the boot output in one call |
-| `rerun` | Reset (DTR/RTS) + flush + monitor — re-run the current firmware without reflashing |
-| `monitor` | Read serial output for a bounded window |
-| `reset_device` | Hardware reset via DTR/RTS |
-| `erase_flash` | Erase the entire flash (destructive) |
-| `erase_region` | Erase an aligned region (destructive) |
-| `read_flash` | Read a flash region to a file |
-| `checksum_md5` | MD5 of a flash region |
+| `flash` | Flash an ELF/binary (no monitor) |
+| `flash_monitor` | Flash, then capture from boot |
+| `rerun` | Reset (no reflash) + capture; `repeat > 1` for flaky-bug runs |
+| `monitor` | Attach + capture only |
+| `chip_info` | Chip type, revision, MAC, flash size (espflash) |
+| `reset_device` | Reset via DTR/RTS (espflash) |
+| `erase_flash` / `erase_region` | Erase flash (destructive, espflash) |
+| `read_flash` / `checksum_md5` | Read / checksum a flash region (espflash) |
+| `list_ports` | Discover serial ports |
 
-Every device tool takes a `port` (e.g. `/dev/ttyACM0`, `/dev/ttyUSB0`). Run
-`list_ports` first to find it.
+## Capture
 
-## Monitoring
+`flash_monitor`, `monitor`, and `rerun` capture until the first of:
 
-`monitor`, `flash_monitor`, and `rerun` capture serial output until one of:
+- **`stop`** — an unanchored regex on the rendered line (`RESULT (PASS|FAIL)`,
+  `panic|abort`). Plain text is a valid pattern.
+- **`stop_on_level`** — defmt only: stop on the first frame at/above a level
+  (e.g. `error`) — the "did it panic?" button.
+- **`idle_ms`** — no new data for this long (default `4000`).
+- **`timeout_s`** — max wall-clock window (default `5`).
+- **`max_bytes`** — byte cap; stops early and marks the output truncated
+  (default `65536`).
 
-- `timeout_secs` — max wall-clock window (default `5`)
-- `stop_pattern` — an **unanchored** regex matched anywhere in the output
-  (alternation works: `RESULT (PASS|FAIL)`, `panic|abort|Guru Meditation`)
-- `idle_timeout_ms` — no new data for this long (default `4000`; raise to
-  6000–10000 for firmware that pauses between prints)
-- `max_bytes` — byte cap; stops early and marks the output truncated
-  (default `65536`, guards against reboot-loop floods)
+**Show filters:** `grep` (regex, both modes), `context` (N lines around the
+`stop` match), and defmt-only `level` (minimum to show) / `module` (regex on the
+module path). In defmt mode a suppressed-by-level count reports what a looser
+`level` would reveal. In text mode, ROM/bootloader boot noise (`strip_boot_noise`)
+and ANSI codes (`strip_ansi`) are stripped by default.
 
-### Output cleaning (defaults)
+## defmt note
 
-| Option | Default | Effect |
-|--------|---------|--------|
-| `strip_boot_noise` | `true` | Drop ROM baud-mismatch garbage and ESP-IDF bootloader log lines; keep output from the first application line |
-| `strip_ansi` | `true` | Remove ANSI escape / color sequences (pure noise tokens for an LLM) |
-| `context_lines` | _unset_ | On a `stop_pattern` match, return only the matched line plus this many lines before it (post-match reboot junk is always dropped) |
-| `flush` | `true` (`monitor`/`rerun`) | Discard bytes buffered before the capture starts (drops a previous run's tail). `flash_monitor` never flushes — it captures from boot |
-
-Set `strip_boot_noise: false` and `strip_ansi: false` to get the raw bytes.
-
-### Typical flows
-
-- **Flash and verify boot** — `flash_monitor` with a `stop_pattern` like
-  `app_main|Ready` (or your own marker).
-- **Iterate on the same binary** — `rerun` instead of `reset_device` + `monitor`;
-  it resets, flushes the stale tail, and captures the fresh boot in one call.
-- **Get a test result** — `stop_pattern: "RESULT (PASS|FAIL)"` with
-  `context_lines: 5` to return just the verdict and a little context.
+defmt decode needs the **exact ELF that's running** — version skew yields
+garbage, not an error. It's free in the flash-then-monitor flow (just built it);
+for bare `monitor`/`rerun`, make sure the auto-detected (or passed) ELF matches.
+The server surfaces a warning when a non-empty stream decodes to zero frames.
 
 ## License
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 import json, subprocess, sys
-BIN = "/home/okhsunrog/code/rust/espflash-mcp/target/release/espflash-mcp"
+BIN = "/home/okhsunrog/code/rust/flashprobe-mcp/target/release/flashprobe-mcp"
 def main():
     tool, args = sys.argv[1], json.loads(sys.argv[2]) if len(sys.argv) > 2 else {}
     p = subprocess.Popen([BIN], stdin=subprocess.PIPE, stdout=subprocess.PIPE,

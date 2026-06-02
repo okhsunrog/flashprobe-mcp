@@ -1,5 +1,5 @@
-//! MCP server for embedded flashing/monitoring. Currently espflash-backed
-//! (serial); probe-rs is added in a later milestone.
+//! flashprobe-mcp: an MCP server for flashing and monitoring embedded targets
+//! over two backends — probe-rs (JTAG/SWD + RTT) and espflash (UART).
 
 mod backend;
 mod capture;
@@ -11,7 +11,7 @@ mod tools;
 
 use anyhow::Result;
 use rmcp::{ServiceExt, transport::io::stdio};
-use server::EspflashServer;
+use server::Server;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -22,9 +22,9 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    info!("Starting espflash MCP server");
+    info!("Starting flashprobe MCP server");
 
-    let server = EspflashServer::new();
+    let server = Server::new();
     let service = server.serve(stdio()).await?;
     service.waiting().await?;
 

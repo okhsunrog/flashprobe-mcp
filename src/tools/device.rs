@@ -6,7 +6,7 @@ use crate::backend::espflash::{connect_to_device, detect_serial_port, flash_file
 use crate::backend::{BackendKind, parse_backend};
 use crate::detect::Detector;
 use crate::inputs::*;
-use crate::server::EspflashServer;
+use crate::server::Server;
 use rmcp::{
     ErrorData as McpError,
     handler::server::wrapper::Parameters,
@@ -19,7 +19,7 @@ use serialport::SerialPortType;
 use crate::backend::probers;
 
 #[tool_router(router = device_router, vis = "pub(crate)")]
-impl EspflashServer {
+impl Server {
     #[tool(description = "List available serial ports that could have ESP devices attached")]
     async fn list_ports(
         &self,
@@ -97,7 +97,7 @@ impl EspflashServer {
     }
 
     #[tool(
-        description = "Flash an ELF or raw binary file to a device. Backend: espflash (serial, default) or probe-rs (JTAG/SWD; pass `chip`). For espflash ELF files the IDF bootloader format is used automatically; for raw binaries provide a flash_address. probe-rs flashes ELF/IDF images."
+        description = "Flash an ELF or raw binary to a device. Backend (REQUIRED): \"probe-rs\" (JTAG/SWD) or \"espflash\" (UART). The file auto-detects from the project (build artifact) if `file_path` is omitted; chip auto-detects for probe-rs. espflash uses IDF bootloader format for ELFs (raw bins need flash_address)."
     )]
     async fn flash(
         &self,

@@ -15,7 +15,7 @@ use crate::capture::{
     raw_text,
 };
 use crate::inputs::*;
-use crate::server::EspflashServer;
+use crate::server::Server;
 use rmcp::{
     ErrorData as McpError,
     handler::server::wrapper::Parameters,
@@ -28,9 +28,9 @@ use std::time::Duration;
 use crate::backend::probers;
 
 #[tool_router(router = capture_router, vis = "pub(crate)")]
-impl EspflashServer {
+impl Server {
     #[tool(
-        description = "Read output from a device for a bounded duration. Backend: espflash (serial, default) or probe-rs (RTT; pass `chip`). Provide `elf` to decode defmt (structured levels/modules; the ELF must match the running firmware), else plain text. By default the buffer is flushed first, boot noise and ANSI codes are stripped (text mode), and on a `stop` match output is focused on the matched line. Stops on: max timeout, regex `stop` match, `stop_on_level` (defmt), idle timeout, or output cap."
+        description = "Read output from a device for a bounded window. Backend (REQUIRED): \"probe-rs\" (RTT) or \"espflash\" (UART). The ELF auto-detects from the project for defmt decode (structured level/module; or pass `elf`); else plain text. Stops on: regex `stop`, `stop_on_level` (defmt), idle_ms, max timeout, or byte cap. Text mode strips boot noise + ANSI and focuses on the `stop` match."
     )]
     async fn monitor(
         &self,
@@ -97,7 +97,7 @@ impl EspflashServer {
     }
 
     #[tool(
-        description = "Flash firmware to a device, then immediately capture output to verify the boot. Backend: espflash (serial, default) or probe-rs (JTAG/SWD flash + RTT; pass `chip`). When an ELF is flashed it is also used for defmt decode automatically (override with `elf`). Captures from boot (no flush). Stops on: max timeout, regex match, `stop_on_level` (defmt), idle timeout, or output cap."
+        description = "Flash firmware, then immediately capture output to verify the boot. Backend (REQUIRED): \"probe-rs\" (flash + RTT) or \"espflash\" (flash + UART). File/chip auto-detect from the project; the flashed ELF is the defmt source. Captures from boot. Stops on: regex `stop`, `stop_on_level` (defmt), idle_ms, max timeout, or byte cap."
     )]
     async fn flash_monitor(
         &self,
@@ -193,7 +193,7 @@ impl EspflashServer {
     }
 
     #[tool(
-        description = "Re-run the firmware already on the device: reset (DTR/RTS for espflash, core reset for probe-rs), then capture the fresh boot. Backend: espflash (serial, default) or probe-rs (RTT; pass `chip`). Provide `elf` for defmt decode. Set repeat > 1 to run N cycles back-to-back and get a compact per-run summary (one matched line per run + a match count) - useful for characterizing flaky/intermittent bugs."
+        description = "Re-run the firmware already on the device: reset (DTR/RTS for espflash, core reset for probe-rs), then capture the fresh boot. Backend (REQUIRED): \"probe-rs\" (RTT) or \"espflash\" (UART). ELF/chip auto-detect from the project for defmt decode. One call instead of reset + monitor. Set repeat > 1 to run N cycles back-to-back for a compact per-run summary - useful for characterizing flaky/intermittent bugs."
     )]
     async fn rerun(
         &self,
