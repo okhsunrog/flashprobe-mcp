@@ -35,8 +35,9 @@ impl ServerHandler for Server {
                 ..Default::default()
             },
             instructions: Some(
-                "Flash + monitor embedded targets: ESP (Xtensa + RISC-V) and ARM \
-                 (STM32/nRF/RP2350/…), over two backends.\n\n\
+                "Flash + monitor embedded targets over two backends — probe-rs \
+                 (JTAG/SWD + RTT; any probe-rs target: STM32, nRF, RP2350, ESP \
+                 Xtensa+RISC-V, …) and espflash (UART; ESP only).\n\n\
                  ## Backend (required)\n\
                  Every flash/monitor call needs `backend`:\n\
                  - \"probe-rs\": JTAG/SWD flashing + RTT capture. Use for firmware that \
