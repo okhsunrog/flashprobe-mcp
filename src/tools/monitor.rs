@@ -1,13 +1,17 @@
 //! Capture tools: `monitor` (attach only), `flash_monitor` (flash then capture
-//! from boot), and `rerun` (reset + capture, optionally N times). Each dispatches
-//! to the espflash (serial) or probe-rs (RTT) backend, then runs the shared
-//! capture pipeline. Grouped into the `capture_router`.
+//! from boot), and `rerun` (reset + capture, optionally N times). Each resolves
+//! a backend (espflash serial or probe-rs RTT), a decode mode (text or defmt,
+//! from the ELF), then runs the shared capture pipeline. Grouped into the
+//! `capture_router`.
 
 use crate::backend::espflash::{SerialSource, connect_to_device, flash_file};
 use crate::backend::{BackendKind, parse_backend};
+use crate::capture::decode::load_defmt_table;
 use crate::capture::filter::{compile_opt_regex, process_capture};
-use crate::capture::render::{last_nonempty_line, render_capture, truncate_line};
-use crate::capture::{ByteSource, CaptureOpts, CaptureResult, decode::TextDecoder, raw_text, run_capture};
+use crate::capture::render::{RenderOpts, last_nonempty_line, render_block, truncate_line};
+use crate::capture::{
+    ByteSource, CaptureOpts, CaptureResult, DecodeMode, DefmtStats, Level, capture, raw_text,
+};
 use crate::inputs::*;
 use crate::server::EspflashServer;
 use rmcp::{
@@ -24,7 +28,7 @@ use crate::backend::probers;
 #[tool_router(router = capture_router, vis = "pub(crate)")]
 impl EspflashServer {
     #[tool(
-        description = "Read serial/RTT output from a device for a bounded duration. Backend: espflash (serial, default) or probe-rs (RTT; pass `chip`). By default the buffer is flushed first, ROM/bootloader boot noise and ANSI color codes are stripped, and on a `stop` match the output is focused on the matched line. Stops on: max timeout, regex `stop` match, idle timeout (no new data), or output cap."
+        description = "Read output from a device for a bounded duration. Backend: espflash (serial, default) or probe-rs (RTT; pass `chip`). Provide `elf` to decode defmt (structured levels/modules; the ELF must match the running firmware), else plain text. By default the buffer is flushed first, boot noise and ANSI codes are stripped (text mode), and on a `stop` match output is focused on the matched line. Stops on: max timeout, regex `stop` match, `stop_on_level` (defmt), idle timeout, or output cap."
     )]
     async fn monitor(
         &self,
@@ -33,10 +37,13 @@ impl EspflashServer {
         let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
             let stop_re = compile_opt_regex(input.stop.as_deref())?;
             let grep_re = compile_opt_regex(input.grep.as_deref())?;
+            let module_re = compile_opt_regex(input.module.as_deref())?;
+            let min_level = parse_level_opt(input.level.as_deref())?;
             let opts = CaptureOpts {
                 timeout: Duration::from_secs_f64(input.timeout_s),
                 idle: Duration::from_millis(input.idle_ms),
                 stop: stop_re.clone(),
+                stop_on_level: parse_level_opt(input.stop_on_level.as_deref())?,
                 flush: input.flush,
                 max_bytes: input.max_bytes,
             };
@@ -52,22 +59,23 @@ impl EspflashServer {
                     BackendKind::ProbeRs => {
                         let chip = require_chip(input.chip.as_deref())?;
                         let session = probers::open_session(chip, input.probe.as_deref())?;
-                        let src = probers::RttSource::attach(session)?;
-                        (Box::new(src), format!("Probe: {chip} via RTT"))
+                        (
+                            Box::new(probers::RttSource::attach(session)?),
+                            format!("Probe: {chip} via RTT"),
+                        )
                     }
                 };
 
-            let mut decoder = TextDecoder::new();
-            let result = run_capture(source.as_mut(), &mut decoder, &opts)?;
+            let defmt = load_optional_table(input.elf.as_deref())?;
+            let mode = decode_mode(&defmt);
+            let (result, stats) = capture(source.as_mut(), &mode, &opts)?;
 
-            let block = render_capture(
+            let block = render_block(
                 &header,
                 &result,
-                input.strip_boot_noise,
-                input.strip_ansi,
-                stop_re.as_ref(),
-                input.context,
-                grep_re.as_ref(),
+                stats,
+                &render_opts(&input.strip_boot_noise, input.strip_ansi, stop_re.as_ref(),
+                    input.context, grep_re.as_ref(), min_level, module_re.as_ref()),
             );
             Ok(format!("## Serial Monitor Output\n\n{block}"))
         })
@@ -79,7 +87,7 @@ impl EspflashServer {
     }
 
     #[tool(
-        description = "Flash firmware to a device, then immediately capture output to verify the boot. Backend: espflash (serial, default) or probe-rs (JTAG/SWD flash + RTT; pass `chip`). Captures from boot (no flush); ROM/bootloader noise and ANSI codes are stripped by default, and on a `stop` match the output is focused on the matched line. Stops on: max timeout, regex match, idle timeout, or output cap."
+        description = "Flash firmware to a device, then immediately capture output to verify the boot. Backend: espflash (serial, default) or probe-rs (JTAG/SWD flash + RTT; pass `chip`). When an ELF is flashed it is also used for defmt decode automatically (override with `elf`). Captures from boot (no flush). Stops on: max timeout, regex match, `stop_on_level` (defmt), idle timeout, or output cap."
     )]
     async fn flash_monitor(
         &self,
@@ -88,10 +96,13 @@ impl EspflashServer {
         let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
             let stop_re = compile_opt_regex(input.stop.as_deref())?;
             let grep_re = compile_opt_regex(input.grep.as_deref())?;
+            let module_re = compile_opt_regex(input.module.as_deref())?;
+            let min_level = parse_level_opt(input.level.as_deref())?;
             let opts = CaptureOpts {
                 timeout: Duration::from_secs_f64(input.timeout_s),
                 idle: Duration::from_millis(input.idle_ms),
                 stop: stop_re.clone(),
+                stop_on_level: parse_level_opt(input.stop_on_level.as_deref())?,
                 flush: false, // do not flush: we want the boot output
                 max_bytes: input.max_bytes,
             };
@@ -102,7 +113,6 @@ impl EspflashServer {
                         let port = require_port(input.port.as_deref())?;
                         let file_data = std::fs::read(&input.file_path)
                             .map_err(|e| format!("Failed to read file '{}': {e}", input.file_path))?;
-
                         let mut flasher = connect_to_device(port, input.flash_baud, true)?;
                         let msg = flash_file(
                             &mut flasher,
@@ -111,17 +121,10 @@ impl EspflashServer {
                             input.partition_table.as_deref(),
                             input.bootloader.as_deref(),
                         )?;
-                        // Drop flasher to release the port (hard reset happens here),
-                        // then let the device start booting before we open the monitor.
-                        drop(flasher);
+                        drop(flasher); // release the port; hard reset happens here
                         std::thread::sleep(Duration::from_millis(100));
-
                         let src = SerialSource::open(port, input.monitor_baud)?;
-                        (
-                            msg,
-                            Box::new(src),
-                            format!("Port: {port} @ {} baud", input.monitor_baud),
-                        )
+                        (msg, Box::new(src), format!("Port: {port} @ {} baud", input.monitor_baud))
                     }
                     #[cfg(feature = "probe-rs")]
                     BackendKind::ProbeRs => {
@@ -133,17 +136,21 @@ impl EspflashServer {
                     }
                 };
 
-            let mut decoder = TextDecoder::new();
-            let result = run_capture(source.as_mut(), &mut decoder, &opts)?;
+            // Default the defmt ELF to the flashed file when it is an ELF.
+            let elf_path = input
+                .elf
+                .clone()
+                .or_else(|| (input.flash_address.is_none()).then(|| input.file_path.clone()));
+            let defmt = load_optional_table(elf_path.as_deref())?;
+            let mode = decode_mode(&defmt);
+            let (result, stats) = capture(source.as_mut(), &mode, &opts)?;
 
-            let block = render_capture(
+            let block = render_block(
                 &header,
                 &result,
-                input.strip_boot_noise,
-                input.strip_ansi,
-                stop_re.as_ref(),
-                input.context,
-                grep_re.as_ref(),
+                stats,
+                &render_opts(&input.strip_boot_noise, input.strip_ansi, stop_re.as_ref(),
+                    input.context, grep_re.as_ref(), min_level, module_re.as_ref()),
             );
             Ok(format!(
                 "## Flash + Monitor\n\n{flash_msg}\n\n### Serial Output\n\n{block}"
@@ -157,7 +164,7 @@ impl EspflashServer {
     }
 
     #[tool(
-        description = "Re-run the firmware already on the device: reset (DTR/RTS for espflash, core reset for probe-rs), then capture the fresh boot. Backend: espflash (serial, default) or probe-rs (RTT; pass `chip`). One call instead of reset + monitor; ideal for iterating without reflashing. Set repeat > 1 to run N cycles back-to-back and get a compact per-run summary (one matched line per run + a match count) - useful for characterizing flaky/intermittent bugs. ROM/bootloader noise and ANSI codes are stripped by default, and on a `stop` match the output is focused on the matched line."
+        description = "Re-run the firmware already on the device: reset (DTR/RTS for espflash, core reset for probe-rs), then capture the fresh boot. Backend: espflash (serial, default) or probe-rs (RTT; pass `chip`). Provide `elf` for defmt decode. Set repeat > 1 to run N cycles back-to-back and get a compact per-run summary (one matched line per run + a match count) - useful for characterizing flaky/intermittent bugs."
     )]
     async fn rerun(
         &self,
@@ -166,8 +173,12 @@ impl EspflashServer {
         let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
             let stop_re = compile_opt_regex(input.stop.as_deref())?;
             let grep_re = compile_opt_regex(input.grep.as_deref())?;
+            let module_re = compile_opt_regex(input.module.as_deref())?;
+            let min_level = parse_level_opt(input.level.as_deref())?;
+            let stop_on_level = parse_level_opt(input.stop_on_level.as_deref())?;
             let repeat = input.repeat.clamp(1, 50);
             let backend = parse_backend(input.backend.as_deref())?;
+            let defmt = load_optional_table(input.elf.as_deref())?;
 
             let header = match &backend {
                 BackendKind::Espflash => {
@@ -181,17 +192,18 @@ impl EspflashServer {
                 }
             };
 
-            // One reset + flush + capture, on the selected backend.
-            let one_cycle = || -> Result<CaptureResult, String> {
+            // One reset + flush + capture on the selected backend / decode mode.
+            let one_cycle = || -> Result<(CaptureResult, Option<DefmtStats>), String> {
                 let opts = CaptureOpts {
                     timeout: Duration::from_secs_f64(input.timeout_s),
                     idle: Duration::from_millis(input.idle_ms),
                     stop: stop_re.clone(),
+                    stop_on_level,
                     flush: true, // start each capture clean
                     max_bytes: input.max_bytes,
                 };
-                let mut decoder = TextDecoder::new();
-                match &backend {
+                let mode = decode_mode(&defmt);
+                let mut source: Box<dyn ByteSource> = match &backend {
                     BackendKind::Espflash => {
                         let port = require_port(input.port.as_deref())?;
                         // No stub, matches reset_device / espflash CLI.
@@ -201,32 +213,28 @@ impl EspflashServer {
                             .reset()
                             .map_err(|e| format!("Failed to reset device: {e}"))?;
                         drop(flasher);
-                        // Let the ROM bootloader start before we open the monitor.
                         std::thread::sleep(Duration::from_millis(100));
-                        let mut src = SerialSource::open(port, input.baud)?;
-                        run_capture(&mut src, &mut decoder, &opts)
+                        Box::new(SerialSource::open(port, input.baud)?)
                     }
                     #[cfg(feature = "probe-rs")]
                     BackendKind::ProbeRs => {
                         let chip = require_chip(input.chip.as_deref())?;
                         let mut session = probers::open_session(chip, input.probe.as_deref())?;
                         probers::reset(&mut session)?;
-                        let mut src = probers::RttSource::attach(session)?;
-                        run_capture(&mut src, &mut decoder, &opts)
+                        Box::new(probers::RttSource::attach(session)?)
                     }
-                }
+                };
+                capture(source.as_mut(), &mode, &opts)
             };
 
             if repeat == 1 {
-                let result = one_cycle()?;
-                let block = render_capture(
+                let (result, stats) = one_cycle()?;
+                let block = render_block(
                     &header,
                     &result,
-                    input.strip_boot_noise,
-                    input.strip_ansi,
-                    stop_re.as_ref(),
-                    input.context,
-                    grep_re.as_ref(),
+                    stats,
+                    &render_opts(&input.strip_boot_noise, input.strip_ansi, stop_re.as_ref(),
+                        input.context, grep_re.as_ref(), min_level, module_re.as_ref()),
                 );
                 return Ok(format!("## Rerun (reset + monitor)\n\n{block}"));
             }
@@ -235,47 +243,25 @@ impl EspflashServer {
             let mut matched_count = 0usize;
             let mut rows = String::new();
             for i in 1..=repeat {
-                let mr = one_cycle()?;
+                let (mr, stats) = one_cycle()?;
                 if mr.matched {
                     matched_count += 1;
                 }
-                let raw = raw_text(&mr);
-                let summary = if mr.matched && stop_re.is_some() {
-                    // Focus to just the matched line (ignore grep for the summary).
-                    process_capture(
-                        &raw,
-                        input.strip_boot_noise,
-                        input.strip_ansi,
-                        stop_re.as_ref(),
-                        true,
-                        Some(0),
-                        None,
-                    )
-                } else {
-                    let clean = process_capture(
-                        &raw,
-                        input.strip_boot_noise,
-                        input.strip_ansi,
-                        None,
-                        false,
-                        None,
-                        grep_re.as_ref(),
-                    );
-                    last_nonempty_line(&clean)
-                };
-                let tag = if mr.matched {
-                    "match"
-                } else {
-                    mr.stop_reason.as_str()
-                };
+                let summary = run_summary(
+                    &mr,
+                    stats.is_some(),
+                    stop_re.as_ref(),
+                    input.strip_boot_noise,
+                    input.strip_ansi,
+                    grep_re.as_ref(),
+                );
+                let tag = if mr.matched { "match" } else { mr.stop_reason.as_str() };
                 rows.push_str(&format!("{i:>2}. [{tag}] {}\n", truncate_line(&summary, 200)));
             }
 
             let header = format!(
-                "## Rerun \u{00d7}{repeat} (reset + monitor)\n\n\
-                 {header}\n\
-                 stop matched in {}/{} runs",
-                matched_count, repeat
+                "## Rerun \u{00d7}{repeat} (reset + monitor)\n\n{header}\n\
+                 stop matched in {matched_count}/{repeat} runs"
             );
             Ok(format!("{header}\n\n```\n{rows}```"))
         })
@@ -296,4 +282,86 @@ fn require_port(port: Option<&str>) -> Result<&str, String> {
 #[cfg(feature = "probe-rs")]
 fn require_chip(chip: Option<&str>) -> Result<&str, String> {
     chip.ok_or_else(|| "backend=probe-rs requires `chip` (e.g. \"esp32c3\")".to_string())
+}
+
+/// Parse an optional level name (`info`, `error`, …).
+fn parse_level_opt(s: Option<&str>) -> Result<Option<Level>, String> {
+    s.map(Level::parse).transpose()
+}
+
+/// Load a defmt table from an optional ELF path (None → text mode).
+type DefmtTable = (defmt_decoder::Table, Vec<u8>);
+fn load_optional_table(elf: Option<&str>) -> Result<Option<DefmtTable>, String> {
+    match elf {
+        Some(path) => load_defmt_table(path),
+        None => Ok(None),
+    }
+}
+
+/// Pick the decode mode from a (maybe) loaded defmt table.
+fn decode_mode(defmt: &Option<DefmtTable>) -> DecodeMode<'_> {
+    match defmt {
+        Some((table, elf)) => DecodeMode::Defmt { table, elf },
+        None => DecodeMode::Text,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_opts<'a>(
+    strip_boot_noise: &bool,
+    strip_ansi: bool,
+    stop_re: Option<&'a regex::Regex>,
+    context: Option<usize>,
+    grep: Option<&'a regex::Regex>,
+    min_level: Option<Level>,
+    module: Option<&'a regex::Regex>,
+) -> RenderOpts<'a> {
+    RenderOpts {
+        strip_boot_noise: *strip_boot_noise,
+        strip_ansi,
+        stop_re,
+        context,
+        grep,
+        min_level,
+        module,
+    }
+}
+
+/// One-line summary of a capture for the repeat>1 table. In defmt mode it reads
+/// the decoded lines directly; in text mode it runs the cleaning pipeline.
+fn run_summary(
+    mr: &CaptureResult,
+    is_defmt: bool,
+    stop_re: Option<&regex::Regex>,
+    strip_boot_noise: bool,
+    strip_ansi: bool,
+    grep: Option<&regex::Regex>,
+) -> String {
+    if is_defmt {
+        if mr.matched && let Some(re) = stop_re {
+            return mr
+                .lines
+                .iter()
+                .rev()
+                .find(|l| re.is_match(&l.text))
+                .map(|l| l.text.clone())
+                .unwrap_or_default();
+        }
+        return mr
+            .lines
+            .iter()
+            .rev()
+            .map(|l| l.text.trim())
+            .find(|t| !t.is_empty())
+            .unwrap_or("(no output)")
+            .to_string();
+    }
+
+    let raw = raw_text(mr);
+    if mr.matched && stop_re.is_some() {
+        process_capture(&raw, strip_boot_noise, strip_ansi, stop_re, true, Some(0), None)
+    } else {
+        let clean = process_capture(&raw, strip_boot_noise, strip_ansi, None, false, None, grep);
+        last_nonempty_line(&clean)
+    }
 }

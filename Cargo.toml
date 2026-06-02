@@ -6,6 +6,8 @@ license = "MIT"
 
 [dependencies]
 anyhow = "1.0.102"
+defmt-decoder = "1.1"
+defmt-parser = "1.0"
 espflash = { version = "4.3.0", default-features = false, features = ["serialport"] }
 probe-rs = { version = "0.31", optional = true }
 regex = "1.12.3"

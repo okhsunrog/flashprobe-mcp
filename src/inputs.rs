@@ -171,6 +171,19 @@ pub struct MonitorInput {
     /// dropped. Applied after cleaning. Useful for full-log captures with no
     /// `stop`, e.g. `grep: "ERROR|WARN"`.
     pub grep: Option<String>,
+    /// Path to the firmware ELF. If it has a `.defmt` section, output is decoded
+    /// as defmt (structured levels/modules); otherwise plain text. The ELF must
+    /// match the running firmware or frames decode to garbage.
+    pub elf: Option<String>,
+    /// defmt only: stop on the first frame at or above this level
+    /// (trace/debug/info/warn/error) - the "did it panic?" button.
+    pub stop_on_level: Option<String>,
+    /// defmt only: minimum level to show (default: show everything; a one-line
+    /// suppressed count reports what a tighter level would hide).
+    pub level: Option<String>,
+    /// defmt only: keep only frames whose module path matches this regex,
+    /// e.g. `module: "app::foc"`.
+    pub module: Option<String>,
     /// Discard any bytes buffered before monitoring starts (default: true).
     /// Prevents catching the tail of a previous run. Set false to keep buffered output.
     #[serde(default = "default_true")]
@@ -225,6 +238,16 @@ pub struct FlashMonitorInput {
     pub context: Option<usize>,
     /// Keep only lines matching this (unanchored) regex; applied after cleaning.
     pub grep: Option<String>,
+    /// Path to the firmware ELF for defmt decode. Defaults to `file_path` when an
+    /// ELF is being flashed (so a defmt build is decoded automatically). If it has
+    /// no `.defmt` section, output is plain text.
+    pub elf: Option<String>,
+    /// defmt only: stop on the first frame at or above this level (trace/debug/info/warn/error).
+    pub stop_on_level: Option<String>,
+    /// defmt only: minimum level to show (default: show everything).
+    pub level: Option<String>,
+    /// defmt only: keep only frames whose module path matches this regex.
+    pub module: Option<String>,
     /// Cap on captured bytes; stops early and marks output truncated (default: 65536).
     #[serde(default = "default_max_bytes")]
     pub max_bytes: usize,
@@ -262,6 +285,15 @@ pub struct RerunInput {
     pub context: Option<usize>,
     /// Keep only lines matching this (unanchored) regex; applied after cleaning.
     pub grep: Option<String>,
+    /// Path to the firmware ELF for defmt decode. If it has a `.defmt` section,
+    /// output is decoded as defmt; otherwise plain text.
+    pub elf: Option<String>,
+    /// defmt only: stop on the first frame at or above this level (trace/debug/info/warn/error).
+    pub stop_on_level: Option<String>,
+    /// defmt only: minimum level to show (default: show everything).
+    pub level: Option<String>,
+    /// defmt only: keep only frames whose module path matches this regex.
+    pub module: Option<String>,
     /// Cap on captured bytes; stops early and marks output truncated (default: 65536).
     #[serde(default = "default_max_bytes")]
     pub max_bytes: usize,

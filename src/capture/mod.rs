@@ -11,11 +11,43 @@ pub mod filter;
 pub mod render;
 pub mod source;
 
-pub use decode::{Decode, Line};
+pub use decode::{Decode, DefmtDecoder, DefmtStats, Level, Line, TextDecoder};
 pub use source::ByteSource;
 
+use defmt_decoder::Table;
 use regex::Regex;
 use std::time::{Duration, Instant};
+
+/// How to decode a capture: plain text, or defmt against a parsed ELF table.
+pub enum DecodeMode<'a> {
+    Text,
+    Defmt { table: &'a Table, elf: &'a [u8] },
+}
+
+/// Run a capture with the decoder selected by `mode`, returning the result and
+/// (in defmt mode) decode stats. This centralizes decoder construction so the
+/// tool methods don't juggle the `Table`/`StreamDecoder` lifetimes.
+pub fn capture(
+    source: &mut dyn ByteSource,
+    mode: &DecodeMode,
+    opts: &CaptureOpts,
+) -> Result<(CaptureResult, Option<DefmtStats>), String> {
+    match mode {
+        DecodeMode::Text => {
+            let mut decoder = TextDecoder::new();
+            let result = run_capture(source, &mut decoder, opts)?;
+            Ok((result, None))
+        }
+        DecodeMode::Defmt { table, elf } => {
+            let locations = table.get_locations(elf).ok();
+            let mut decoder =
+                DefmtDecoder::new(table.new_stream_decoder(), locations, table.has_timestamp());
+            let result = run_capture(source, &mut decoder, opts)?;
+            let stats = decoder.stats();
+            Ok((result, Some(stats)))
+        }
+    }
+}
 
 /// Why a capture stopped. Display strings are preserved verbatim from the
 /// original implementation so rendered output is unchanged.
@@ -40,12 +72,16 @@ impl StopReason {
     }
 }
 
-/// Bounds and stop conditions for a capture. (defmt-only conditions like
-/// `stop_on_level` are added in a later milestone.)
+/// Bounds and stop conditions for a capture. Any one stop condition ending the
+/// capture is the Ctrl-C replacement.
 pub struct CaptureOpts {
     pub timeout: Duration,
     pub idle: Duration,
+    /// Stop when this regex matches a rendered line (both modes).
     pub stop: Option<Regex>,
+    /// Stop on the first frame at or above this level (defmt mode only; text
+    /// lines carry no level, so this never fires on them).
+    pub stop_on_level: Option<Level>,
     pub flush: bool,
     pub max_bytes: usize,
 }
@@ -141,7 +177,10 @@ pub fn run_capture(
                 let new_lines = decoder.push(&buf[..n]);
                 let had_new_lines = !new_lines.is_empty();
                 for line in new_lines {
-                    let is_match = !matched && stop.is_some_and(|re| re.is_match(&line.text));
+                    let is_match = !matched
+                        && (stop.is_some_and(|re| re.is_match(&line.text))
+                            || matches!((opts.stop_on_level, line.level),
+                                (Some(threshold), Some(level)) if level >= threshold));
                     lines.push(line);
                     if is_match {
                         matched = true;
