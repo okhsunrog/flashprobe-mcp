@@ -40,9 +40,20 @@ pub struct ListPortsInput {}
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ChipInfoInput {
-    /// Serial port path (e.g., "/dev/ttyUSB0" or "/dev/ttyACM0")
-    pub port: String,
-    /// Baud rate for communication (default: 460800)
+    /// Backend (REQUIRED): "probe-rs" (target name + cores + memory map) or
+    /// "espflash" (ESP chip type, revision, MAC, crystal, flash size).
+    pub backend: Option<String>,
+    /// Serial port (espflash). Auto-detected if exactly one USB port.
+    pub port: Option<String>,
+    /// Chip/target name (probe-rs). Auto-detected from .cargo/config.toml if omitted.
+    pub chip: Option<String>,
+    /// probe-rs probe selector VID:PID[:SERIAL] (hex). Omit if only one probe.
+    pub probe: Option<String>,
+    /// Project directory for chip auto-detection (defaults to cwd).
+    pub project_dir: Option<String>,
+    /// Binary name to disambiguate a multi-binary workspace.
+    pub bin: Option<String>,
+    /// Baud rate (default: 460800). espflash backend only.
     #[serde(default = "default_baud")]
     pub baud: u32,
 }
@@ -79,56 +90,108 @@ pub struct FlashInput {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct EraseFlashInput {
-    /// Serial port path
-    pub port: String,
-    /// Baud rate (default: 460800)
+    /// Backend (REQUIRED): "probe-rs" (flash-algo erase) or "espflash" (ROM erase).
+    pub backend: Option<String>,
+    /// Serial port (espflash). Auto-detected if exactly one USB port.
+    pub port: Option<String>,
+    /// Chip/target name (probe-rs). Auto-detected from .cargo/config.toml if omitted.
+    pub chip: Option<String>,
+    /// probe-rs probe selector VID:PID[:SERIAL] (hex).
+    pub probe: Option<String>,
+    /// Project directory for chip auto-detection (defaults to cwd).
+    pub project_dir: Option<String>,
+    /// Binary name to disambiguate a multi-binary workspace.
+    pub bin: Option<String>,
+    /// Baud rate (default: 460800). espflash backend only.
     #[serde(default = "default_baud")]
     pub baud: u32,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct EraseRegionInput {
-    /// Serial port path
-    pub port: String,
-    /// Start address to erase (must be 4096-byte aligned)
+    /// Backend (REQUIRED): "probe-rs" or "espflash".
+    pub backend: Option<String>,
+    /// Serial port (espflash). Auto-detected if exactly one USB port.
+    pub port: Option<String>,
+    /// Chip/target name (probe-rs). Auto-detected from .cargo/config.toml if omitted.
+    pub chip: Option<String>,
+    /// probe-rs probe selector VID:PID[:SERIAL] (hex).
+    pub probe: Option<String>,
+    /// Project directory for chip auto-detection (defaults to cwd).
+    pub project_dir: Option<String>,
+    /// Binary name to disambiguate a multi-binary workspace.
+    pub bin: Option<String>,
+    /// Start address to erase. espflash requires 4096-byte (0x1000) alignment;
+    /// probe-rs erases the flash sectors covering the range.
     pub address: u32,
-    /// Number of bytes to erase (must be 4096-byte aligned)
+    /// Number of bytes to erase (espflash: 4096-byte aligned).
     pub size: u32,
-    /// Baud rate (default: 460800)
+    /// Baud rate (default: 460800). espflash backend only.
     #[serde(default = "default_baud")]
     pub baud: u32,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ReadFlashInput {
-    /// Serial port path
-    pub port: String,
+    /// Backend (REQUIRED): "probe-rs" (memory read) or "espflash" (ROM read).
+    pub backend: Option<String>,
+    /// Serial port (espflash). Auto-detected if exactly one USB port.
+    pub port: Option<String>,
+    /// Chip/target name (probe-rs). Auto-detected from .cargo/config.toml if omitted.
+    pub chip: Option<String>,
+    /// probe-rs probe selector VID:PID[:SERIAL] (hex).
+    pub probe: Option<String>,
+    /// Project directory for chip auto-detection (defaults to cwd).
+    pub project_dir: Option<String>,
+    /// Binary name to disambiguate a multi-binary workspace.
+    pub bin: Option<String>,
     /// Start address to read from
     pub address: u32,
     /// Number of bytes to read
     pub size: u32,
     /// Path to save the output file
     pub output_path: String,
-    /// Baud rate (default: 460800)
+    /// Baud rate (default: 460800). espflash backend only.
     #[serde(default = "default_baud")]
     pub baud: u32,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ResetDeviceInput {
-    /// Serial port path
-    pub port: String,
+    /// Backend (REQUIRED): "probe-rs" (core reset) or "espflash" (DTR/RTS reset).
+    pub backend: Option<String>,
+    /// Serial port (espflash). Auto-detected if exactly one USB port.
+    pub port: Option<String>,
+    /// Chip/target name (probe-rs). Auto-detected from .cargo/config.toml if omitted.
+    pub chip: Option<String>,
+    /// probe-rs probe selector VID:PID[:SERIAL] (hex).
+    pub probe: Option<String>,
+    /// Project directory for chip auto-detection (defaults to cwd).
+    pub project_dir: Option<String>,
+    /// Binary name to disambiguate a multi-binary workspace.
+    pub bin: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ChecksumMd5Input {
-    /// Serial port path
-    pub port: String,
-    /// Start address of the flash region
+    /// Backend (REQUIRED): "probe-rs" (read + host-side MD5) or "espflash"
+    /// (on-device ROM MD5).
+    pub backend: Option<String>,
+    /// Serial port (espflash). Auto-detected if exactly one USB port.
+    pub port: Option<String>,
+    /// Chip/target name (probe-rs). Auto-detected from .cargo/config.toml if omitted.
+    pub chip: Option<String>,
+    /// probe-rs probe selector VID:PID[:SERIAL] (hex).
+    pub probe: Option<String>,
+    /// Project directory for chip auto-detection (defaults to cwd).
+    pub project_dir: Option<String>,
+    /// Binary name to disambiguate a multi-binary workspace.
+    pub bin: Option<String>,
+    /// Start address of the region
     pub address: u32,
-    /// Size of the flash region in bytes
+    /// Size of the region in bytes
     pub size: u32,
-    /// Baud rate (default: 460800)
+    /// Baud rate (default: 460800). espflash backend only.
     #[serde(default = "default_baud")]
     pub baud: u32,
 }

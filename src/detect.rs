@@ -15,15 +15,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::LazyLock;
 
-/// What we could derive about the project.
-pub struct Detected {
-    /// Path to the build artifact ELF.
-    pub elf: PathBuf,
-    /// Chip/target name from the runner config, if found. Used by probe-rs only.
-    #[cfg_attr(not(feature = "probe-rs"), allow(dead_code))]
-    pub chip: Option<String>,
-}
-
 #[derive(Deserialize)]
 struct Metadata {
     target_directory: String,
@@ -41,12 +32,16 @@ struct CargoTarget {
     kind: Vec<String>,
 }
 
-/// Runs project detection at most once and resolves individual fields, letting
-/// an explicit value win over the detected one. Tools create one per call.
+/// Resolves project fields on demand, letting an explicit value win over the
+/// detected one. Chip and ELF are detected independently: the chip comes from
+/// `.cargo/config.toml` (no `cargo metadata`, no `bin` needed), while the ELF
+/// needs the build artifact (which does need `bin` to disambiguate). Each is
+/// computed at most once. Tools create one per call.
 pub struct Detector<'a> {
     project_dir: Option<&'a str>,
     bin: Option<&'a str>,
-    cache: Option<Result<Detected, String>>,
+    elf_cache: Option<Result<PathBuf, String>>,
+    chip_cache: Option<Option<String>>,
 }
 
 impl<'a> Detector<'a> {
@@ -54,25 +49,32 @@ impl<'a> Detector<'a> {
         Self {
             project_dir,
             bin,
-            cache: None,
+            elf_cache: None,
+            chip_cache: None,
         }
     }
 
-    fn get(&mut self) -> &Result<Detected, String> {
-        if self.cache.is_none() {
-            self.cache = Some(detect_project(self.project_dir, self.bin));
+    fn dir(&self) -> PathBuf {
+        match self.project_dir {
+            Some(d) => PathBuf::from(d),
+            None => std::env::current_dir().unwrap_or_default(),
         }
-        self.cache.as_ref().unwrap()
+    }
+
+    fn elf_result(&mut self) -> &Result<PathBuf, String> {
+        if self.elf_cache.is_none() {
+            self.elf_cache = Some(detect_elf(self.project_dir, self.bin));
+        }
+        self.elf_cache.as_ref().unwrap()
     }
 
     /// The file to flash / ELF: explicit path wins, else the detected artifact.
-    /// Errors (with detection guidance) if neither is available.
     pub fn elf(&mut self, explicit: Option<&str>) -> Result<String, String> {
         if let Some(e) = explicit {
             return Ok(e.to_string());
         }
-        match self.get() {
-            Ok(d) => Ok(d.elf.display().to_string()),
+        match self.elf_result() {
+            Ok(p) => Ok(p.display().to_string()),
             Err(e) => Err(e.clone()),
         }
     }
@@ -83,33 +85,30 @@ impl<'a> Detector<'a> {
         if let Some(e) = explicit {
             return Some(e.to_string());
         }
-        match self.get() {
-            Ok(d) => Some(d.elf.display().to_string()),
-            Err(_) => None,
-        }
+        self.elf_result().as_ref().ok().map(|p| p.display().to_string())
     }
 
-    /// Chip/target name: explicit wins, else the detected chip. Errors if neither.
-    /// Only the probe-rs backend needs a chip name.
+    /// Chip/target name: explicit wins, else the `--chip` from the config runner.
+    /// Does not need `cargo metadata` or `bin`. Only the probe-rs backend uses it.
     #[cfg_attr(not(feature = "probe-rs"), allow(dead_code))]
     pub fn chip(&mut self, explicit: Option<&str>) -> Result<String, String> {
         if let Some(c) = explicit {
             return Ok(c.to_string());
         }
-        match self.get() {
-            Ok(d) => d.chip.clone().ok_or_else(|| {
-                "could not auto-detect `chip` (no --chip in .cargo/config.toml); pass it \
-                 explicitly, e.g. \"esp32c6\""
-                    .to_string()
-            }),
-            Err(e) => Err(e.clone()),
+        if self.chip_cache.is_none() {
+            self.chip_cache = Some(read_cargo_config(&self.dir()).1);
         }
+        self.chip_cache.clone().flatten().ok_or_else(|| {
+            "could not auto-detect `chip` (no --chip in .cargo/config.toml); pass it \
+             explicitly, e.g. \"esp32c6\""
+                .to_string()
+        })
     }
 }
 
-/// Resolve the project's build artifact and chip. `project_dir` defaults to the
+/// Locate the project's build artifact ELF. `project_dir` defaults to the
 /// process cwd; `bin` disambiguates a multi-binary workspace.
-pub fn detect_project(project_dir: Option<&str>, bin: Option<&str>) -> Result<Detected, String> {
+pub fn detect_elf(project_dir: Option<&str>, bin: Option<&str>) -> Result<PathBuf, String> {
     let dir = match project_dir {
         Some(d) => PathBuf::from(d),
         None => std::env::current_dir()
@@ -118,10 +117,8 @@ pub fn detect_project(project_dir: Option<&str>, bin: Option<&str>) -> Result<De
 
     let meta = cargo_metadata(&dir)?;
     let bin_name = pick_bin(&meta, bin)?;
-    let (triple, chip) = read_cargo_config(&dir);
-    let elf = locate_artifact(Path::new(&meta.target_directory), triple.as_deref(), &bin_name)?;
-
-    Ok(Detected { elf, chip })
+    let (triple, _chip) = read_cargo_config(&dir);
+    locate_artifact(Path::new(&meta.target_directory), triple.as_deref(), &bin_name)
 }
 
 fn cargo_metadata(dir: &Path) -> Result<Metadata, String> {

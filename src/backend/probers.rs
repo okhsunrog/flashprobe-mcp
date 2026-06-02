@@ -6,11 +6,14 @@
 //! `--no-default-features`.
 
 use crate::capture::ByteSource;
-use probe_rs::flashing::{ElfOptions, Format, IdfOptions, download_file};
+use probe_rs::config::MemoryRegion;
+use probe_rs::flashing::{
+    ElfOptions, FlashProgress, Format, IdfOptions, download_file, erase, erase_all,
+};
 use probe_rs::probe::DebugProbeInfo;
 use probe_rs::probe::list::Lister;
 use probe_rs::rtt::Rtt;
-use probe_rs::{Permissions, Session};
+use probe_rs::{MemoryInterface, Permissions, Session};
 use std::time::Duration;
 
 /// Default RTT up-channel to read (channel 0 is the conventional terminal).
@@ -117,6 +120,92 @@ pub fn reset(session: &mut Session) -> Result<(), String> {
         .map_err(|e| format!("Failed to reset device: {e}"))?;
     std::thread::sleep(Duration::from_millis(200));
     Ok(())
+}
+
+/// Erase the entire flash via the flash algorithm.
+pub fn erase_flash(session: &mut Session) -> Result<String, String> {
+    erase_all(session, &mut FlashProgress::empty(), false)
+        .map_err(|e| format!("probe-rs erase_all failed: {e}"))?;
+    Ok("Successfully erased entire flash memory.".to_string())
+}
+
+/// Erase the flash sectors covering `[address, address+size)`.
+pub fn erase_region(session: &mut Session, address: u32, size: u32) -> Result<String, String> {
+    let start = address as u64;
+    let end = start + size as u64;
+    erase(session, &mut FlashProgress::empty(), start, end, false)
+        .map_err(|e| format!("probe-rs erase failed: {e}"))?;
+    Ok(format!(
+        "Successfully erased the sectors covering 0x{size:x} bytes at 0x{address:08x}"
+    ))
+}
+
+/// Read `size` bytes of target memory at `address` into `out_path`.
+pub fn read_flash(
+    session: &mut Session,
+    address: u32,
+    size: u32,
+    out_path: &str,
+) -> Result<u64, String> {
+    let mut buf = vec![0u8; size as usize];
+    session
+        .core(0)
+        .map_err(|e| format!("Failed to access core: {e}"))?
+        .read(address as u64, &mut buf)
+        .map_err(|e| format!("probe-rs memory read failed: {e}"))?;
+    std::fs::write(out_path, &buf).map_err(|e| format!("Failed to write '{out_path}': {e}"))?;
+    Ok(buf.len() as u64)
+}
+
+/// MD5 of `size` bytes of target memory at `address` (read host-side; probe-rs
+/// has no on-device MD5 like the ESP ROM does).
+pub fn checksum_md5(session: &mut Session, address: u32, size: u32) -> Result<String, String> {
+    let mut buf = vec![0u8; size as usize];
+    session
+        .core(0)
+        .map_err(|e| format!("Failed to access core: {e}"))?
+        .read(address as u64, &mut buf)
+        .map_err(|e| format!("probe-rs memory read failed: {e}"))?;
+    Ok(format!("{:x}", md5::compute(&buf)))
+}
+
+/// Target/chip information from the probe-rs target description: name, cores, and
+/// memory map. (MAC/crystal/revision are ESP-ROM concepts, not available here.)
+pub fn chip_info(session: &mut Session) -> Result<String, String> {
+    let name = session.target().name.clone();
+    let cores: Vec<String> = session
+        .list_cores()
+        .into_iter()
+        .map(|(i, kind)| format!("core {i}: {kind:?}"))
+        .collect();
+    let regions: Vec<String> = session
+        .target()
+        .memory_map
+        .iter()
+        .map(|r| {
+            let (kind, label) = match r {
+                MemoryRegion::Ram(m) => ("RAM", m.name.as_deref()),
+                MemoryRegion::Nvm(m) => ("flash/NVM", m.name.as_deref()),
+                MemoryRegion::Generic(m) => ("generic", m.name.as_deref()),
+            };
+            let range = r.address_range();
+            format!(
+                "- {kind}{}: 0x{:08x}..0x{:08x} ({} KiB)",
+                label.map(|n| format!(" \"{n}\"")).unwrap_or_default(),
+                range.start,
+                range.end,
+                (range.end - range.start) / 1024
+            )
+        })
+        .collect();
+
+    let mut out = format!("## Target Information (probe-rs)\n\n- Target: {name}\n");
+    out.push_str(&format!("- Cores: {}\n", cores.join(", ")));
+    out.push_str("- Memory map:\n");
+    for region in regions {
+        out.push_str(&format!("  {region}\n"));
+    }
+    Ok(out)
 }
 
 /// A [`ByteSource`] over an RTT up-channel. Holds the session and re-borrows the

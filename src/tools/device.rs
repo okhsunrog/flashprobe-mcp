@@ -60,34 +60,47 @@ impl Server {
     }
 
     #[tool(
-        description = "Connect to an ESP device and retrieve chip information including type, revision, MAC address, flash size, and features"
+        description = "Retrieve chip/target information. Backend (REQUIRED): \"espflash\" (ESP chip type, revision, MAC, crystal, flash size, features via the ROM) or \"probe-rs\" (target name, cores, and memory map from the probe-rs target description)."
     )]
     async fn chip_info(
         &self,
         Parameters(input): Parameters<ChipInfoInput>,
     ) -> Result<CallToolResult, McpError> {
         let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
-            let mut flasher = connect_to_device(&input.port, input.baud, true)?;
+            // Used by the probe-rs arm (chip auto-detect); some tools don't touch
+            // it in an espflash-only build, where that arm is cfg'd out.
+            #[cfg_attr(not(feature = "probe-rs"), allow(unused_variables, unused_mut))]
+            let mut det = Detector::new(input.project_dir.as_deref(), input.bin.as_deref());
+            match parse_backend(input.backend.as_deref())? {
+                BackendKind::Espflash => {
+                    let port = detect_serial_port(input.port.as_deref())?;
+                    let mut flasher = connect_to_device(&port, input.baud, true)?;
+                    let info = flasher
+                        .device_info()
+                        .map_err(|e| format!("Failed to get device info: {e}"))?;
 
-            let info = flasher
-                .device_info()
-                .map_err(|e| format!("Failed to get device info: {e}"))?;
-
-            let mut output = String::from("## Device Information\n\n");
-            output.push_str(&format!("- Chip: {}\n", info.chip));
-            if let Some((major, minor)) = info.revision {
-                output.push_str(&format!("- Revision: v{major}.{minor}\n"));
+                    let mut output = String::from("## Device Information\n\n");
+                    output.push_str(&format!("- Chip: {}\n", info.chip));
+                    if let Some((major, minor)) = info.revision {
+                        output.push_str(&format!("- Revision: v{major}.{minor}\n"));
+                    }
+                    output.push_str(&format!("- Crystal frequency: {}\n", info.crystal_frequency));
+                    output.push_str(&format!("- Flash size: {}\n", info.flash_size));
+                    if let Some(mac) = &info.mac_address {
+                        output.push_str(&format!("- MAC address: {mac}\n"));
+                    }
+                    if !info.features.is_empty() {
+                        output.push_str(&format!("- Features: {}\n", info.features.join(", ")));
+                    }
+                    Ok(output)
+                }
+                #[cfg(feature = "probe-rs")]
+                BackendKind::ProbeRs => {
+                    let chip = det.chip(input.chip.as_deref())?;
+                    let mut session = probers::open_session(&chip, input.probe.as_deref())?;
+                    probers::chip_info(&mut session)
+                }
             }
-            output.push_str(&format!("- Crystal frequency: {}\n", info.crystal_frequency));
-            output.push_str(&format!("- Flash size: {}\n", info.flash_size));
-            if let Some(mac) = &info.mac_address {
-                output.push_str(&format!("- MAC address: {mac}\n"));
-            }
-            if !info.features.is_empty() {
-                output.push_str(&format!("- Features: {}\n", info.features.join(", ")));
-            }
-
-            Ok(output)
         })
         .await
         .map_err(|e| McpError::internal_error(e.to_string(), None))?
@@ -104,6 +117,9 @@ impl Server {
         Parameters(input): Parameters<FlashInput>,
     ) -> Result<CallToolResult, McpError> {
         let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
+            // Used by the probe-rs arm (chip auto-detect); some tools don't touch
+            // it in an espflash-only build, where that arm is cfg'd out.
+            #[cfg_attr(not(feature = "probe-rs"), allow(unused_variables, unused_mut))]
             let mut det = Detector::new(input.project_dir.as_deref(), input.bin.as_deref());
             // The file to flash: explicit, else the detected build artifact.
             let file_path = det.elf(input.file_path.as_deref())?;
@@ -138,20 +154,33 @@ impl Server {
     }
 
     #[tool(
-        description = "Erase the entire flash memory of the connected ESP device. WARNING: This is irreversible and will delete all data including firmware."
+        description = "Erase the entire flash. WARNING: irreversible. Backend (REQUIRED): \"probe-rs\" (flash-algo erase) or \"espflash\" (ROM erase)."
     )]
     async fn erase_flash(
         &self,
         Parameters(input): Parameters<EraseFlashInput>,
     ) -> Result<CallToolResult, McpError> {
         let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
-            let mut flasher = connect_to_device(&input.port, input.baud, true)?;
-
-            flasher
-                .erase_flash()
-                .map_err(|e| format!("Failed to erase flash: {e}"))?;
-
-            Ok("Successfully erased entire flash memory.".to_string())
+            // Used by the probe-rs arm (chip auto-detect); some tools don't touch
+            // it in an espflash-only build, where that arm is cfg'd out.
+            #[cfg_attr(not(feature = "probe-rs"), allow(unused_variables, unused_mut))]
+            let mut det = Detector::new(input.project_dir.as_deref(), input.bin.as_deref());
+            match parse_backend(input.backend.as_deref())? {
+                BackendKind::Espflash => {
+                    let port = detect_serial_port(input.port.as_deref())?;
+                    let mut flasher = connect_to_device(&port, input.baud, true)?;
+                    flasher
+                        .erase_flash()
+                        .map_err(|e| format!("Failed to erase flash: {e}"))?;
+                    Ok("Successfully erased entire flash memory.".to_string())
+                }
+                #[cfg(feature = "probe-rs")]
+                BackendKind::ProbeRs => {
+                    let chip = det.chip(input.chip.as_deref())?;
+                    let mut session = probers::open_session(&chip, input.probe.as_deref())?;
+                    probers::erase_flash(&mut session)
+                }
+            }
         })
         .await
         .map_err(|e| McpError::internal_error(e.to_string(), None))?
@@ -161,33 +190,45 @@ impl Server {
     }
 
     #[tool(
-        description = "Erase a specific region of flash memory. Both address and size must be 4096-byte (0x1000) aligned."
+        description = "Erase a flash region. Backend (REQUIRED): \"probe-rs\" (erases sectors covering the range) or \"espflash\" (address+size must be 4096-byte/0x1000 aligned)."
     )]
     async fn erase_region(
         &self,
         Parameters(input): Parameters<EraseRegionInput>,
     ) -> Result<CallToolResult, McpError> {
         let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
-            if input.address % 0x1000 != 0 {
-                return Err(format!(
-                    "Address 0x{:08x} is not 4096-byte aligned",
-                    input.address
-                ));
+            // Used by the probe-rs arm (chip auto-detect); some tools don't touch
+            // it in an espflash-only build, where that arm is cfg'd out.
+            #[cfg_attr(not(feature = "probe-rs"), allow(unused_variables, unused_mut))]
+            let mut det = Detector::new(input.project_dir.as_deref(), input.bin.as_deref());
+            match parse_backend(input.backend.as_deref())? {
+                BackendKind::Espflash => {
+                    if input.address % 0x1000 != 0 {
+                        return Err(format!(
+                            "Address 0x{:08x} is not 4096-byte aligned",
+                            input.address
+                        ));
+                    }
+                    if input.size % 0x1000 != 0 {
+                        return Err(format!("Size 0x{:x} is not 4096-byte aligned", input.size));
+                    }
+                    let port = detect_serial_port(input.port.as_deref())?;
+                    let mut flasher = connect_to_device(&port, input.baud, true)?;
+                    flasher
+                        .erase_region(input.address, input.size)
+                        .map_err(|e| format!("Failed to erase region: {e}"))?;
+                    Ok(format!(
+                        "Successfully erased 0x{:x} bytes at address 0x{:08x}",
+                        input.size, input.address
+                    ))
+                }
+                #[cfg(feature = "probe-rs")]
+                BackendKind::ProbeRs => {
+                    let chip = det.chip(input.chip.as_deref())?;
+                    let mut session = probers::open_session(&chip, input.probe.as_deref())?;
+                    probers::erase_region(&mut session, input.address, input.size)
+                }
             }
-            if input.size % 0x1000 != 0 {
-                return Err(format!("Size 0x{:x} is not 4096-byte aligned", input.size));
-            }
-
-            let mut flasher = connect_to_device(&input.port, input.baud, true)?;
-
-            flasher
-                .erase_region(input.address, input.size)
-                .map_err(|e| format!("Failed to erase region: {e}"))?;
-
-            Ok(format!(
-                "Successfully erased 0x{:x} bytes at address 0x{:08x}",
-                input.size, input.address
-            ))
         })
         .await
         .map_err(|e| McpError::internal_error(e.to_string(), None))?
@@ -196,34 +237,50 @@ impl Server {
         Ok(CallToolResult::success(vec![Content::text(result)]))
     }
 
-    #[tool(description = "Read flash memory contents and save to a file")]
+    #[tool(
+        description = "Read a memory/flash region to a file. Backend (REQUIRED): \"probe-rs\" (debug-port memory read) or \"espflash\" (ROM flash read)."
+    )]
     async fn read_flash(
         &self,
         Parameters(input): Parameters<ReadFlashInput>,
     ) -> Result<CallToolResult, McpError> {
         let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
-            let mut flasher = connect_to_device(&input.port, input.baud, true)?;
-
-            let output_path = std::path::PathBuf::from(&input.output_path);
-
-            flasher
-                .read_flash(
-                    input.address,
-                    input.size,
-                    0x400, // block_size
-                    32,    // max_in_flight
-                    output_path.clone(),
-                )
-                .map_err(|e| format!("Failed to read flash: {e}"))?;
-
-            let file_size = std::fs::metadata(&output_path).map(|m| m.len()).unwrap_or(0);
-
-            Ok(format!(
-                "Successfully read 0x{:x} bytes from address 0x{:08x} to '{}' ({file_size} bytes written)",
-                input.size,
-                input.address,
-                output_path.display()
-            ))
+            // Used by the probe-rs arm (chip auto-detect); some tools don't touch
+            // it in an espflash-only build, where that arm is cfg'd out.
+            #[cfg_attr(not(feature = "probe-rs"), allow(unused_variables, unused_mut))]
+            let mut det = Detector::new(input.project_dir.as_deref(), input.bin.as_deref());
+            match parse_backend(input.backend.as_deref())? {
+                BackendKind::Espflash => {
+                    let port = detect_serial_port(input.port.as_deref())?;
+                    let mut flasher = connect_to_device(&port, input.baud, true)?;
+                    let output_path = std::path::PathBuf::from(&input.output_path);
+                    flasher
+                        .read_flash(input.address, input.size, 0x400, 32, output_path.clone())
+                        .map_err(|e| format!("Failed to read flash: {e}"))?;
+                    let n = std::fs::metadata(&output_path).map(|m| m.len()).unwrap_or(0);
+                    Ok(format!(
+                        "Successfully read 0x{:x} bytes from 0x{:08x} to '{}' ({n} bytes written)",
+                        input.size,
+                        input.address,
+                        output_path.display()
+                    ))
+                }
+                #[cfg(feature = "probe-rs")]
+                BackendKind::ProbeRs => {
+                    let chip = det.chip(input.chip.as_deref())?;
+                    let mut session = probers::open_session(&chip, input.probe.as_deref())?;
+                    let n = probers::read_flash(
+                        &mut session,
+                        input.address,
+                        input.size,
+                        &input.output_path,
+                    )?;
+                    Ok(format!(
+                        "Successfully read 0x{:x} bytes from 0x{:08x} to '{}' ({n} bytes written)",
+                        input.size, input.address, input.output_path
+                    ))
+                }
+            }
         })
         .await
         .map_err(|e| McpError::internal_error(e.to_string(), None))?
@@ -232,21 +289,37 @@ impl Server {
         Ok(CallToolResult::success(vec![Content::text(result)]))
     }
 
-    #[tool(description = "Reset the connected ESP device using DTR/RTS serial control lines")]
+    #[tool(
+        description = "Reset the device. Backend (REQUIRED): \"probe-rs\" (core reset via the debug port) or \"espflash\" (DTR/RTS serial reset)."
+    )]
     async fn reset_device(
         &self,
         Parameters(input): Parameters<ResetDeviceInput>,
     ) -> Result<CallToolResult, McpError> {
         let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
-            // Connect without stub for reset (matches espflash CLI behavior)
-            let mut flasher = connect_to_device(&input.port, 115_200, false)?;
-
-            flasher
-                .connection()
-                .reset()
-                .map_err(|e| format!("Failed to reset device: {e}"))?;
-
-            Ok("Device reset successfully.".to_string())
+            // Used by the probe-rs arm (chip auto-detect); some tools don't touch
+            // it in an espflash-only build, where that arm is cfg'd out.
+            #[cfg_attr(not(feature = "probe-rs"), allow(unused_variables, unused_mut))]
+            let mut det = Detector::new(input.project_dir.as_deref(), input.bin.as_deref());
+            match parse_backend(input.backend.as_deref())? {
+                BackendKind::Espflash => {
+                    let port = detect_serial_port(input.port.as_deref())?;
+                    // Connect without stub for reset (matches espflash CLI behavior).
+                    let mut flasher = connect_to_device(&port, 115_200, false)?;
+                    flasher
+                        .connection()
+                        .reset()
+                        .map_err(|e| format!("Failed to reset device: {e}"))?;
+                    Ok("Device reset successfully.".to_string())
+                }
+                #[cfg(feature = "probe-rs")]
+                BackendKind::ProbeRs => {
+                    let chip = det.chip(input.chip.as_deref())?;
+                    let mut session = probers::open_session(&chip, input.probe.as_deref())?;
+                    probers::reset(&mut session)?;
+                    Ok("Device reset successfully.".to_string())
+                }
+            }
         })
         .await
         .map_err(|e| McpError::internal_error(e.to_string(), None))?
@@ -255,21 +328,37 @@ impl Server {
         Ok(CallToolResult::success(vec![Content::text(result)]))
     }
 
-    #[tool(description = "Compute the MD5 checksum of a flash memory region")]
+    #[tool(
+        description = "MD5 checksum of a memory/flash region. Backend (REQUIRED): \"espflash\" (fast on-device ROM MD5) or \"probe-rs\" (read the region, hash host-side)."
+    )]
     async fn checksum_md5(
         &self,
         Parameters(input): Parameters<ChecksumMd5Input>,
     ) -> Result<CallToolResult, McpError> {
         let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
-            let mut flasher = connect_to_device(&input.port, input.baud, true)?;
-
-            let checksum = flasher
-                .checksum_md5(input.address, input.size)
-                .map_err(|e| format!("Failed to compute checksum: {e}"))?;
-
+            // Used by the probe-rs arm (chip auto-detect); some tools don't touch
+            // it in an espflash-only build, where that arm is cfg'd out.
+            #[cfg_attr(not(feature = "probe-rs"), allow(unused_variables, unused_mut))]
+            let mut det = Detector::new(input.project_dir.as_deref(), input.bin.as_deref());
+            let digest = match parse_backend(input.backend.as_deref())? {
+                BackendKind::Espflash => {
+                    let port = detect_serial_port(input.port.as_deref())?;
+                    let mut flasher = connect_to_device(&port, input.baud, true)?;
+                    let sum = flasher
+                        .checksum_md5(input.address, input.size)
+                        .map_err(|e| format!("Failed to compute checksum: {e}"))?;
+                    format!("{sum:032x}")
+                }
+                #[cfg(feature = "probe-rs")]
+                BackendKind::ProbeRs => {
+                    let chip = det.chip(input.chip.as_deref())?;
+                    let mut session = probers::open_session(&chip, input.probe.as_deref())?;
+                    probers::checksum_md5(&mut session, input.address, input.size)?
+                }
+            };
             Ok(format!(
-                "MD5 checksum of 0x{:x} bytes at 0x{:08x}: {:032x}",
-                input.size, input.address, checksum
+                "MD5 of 0x{:x} bytes at 0x{:08x}: {digest}",
+                input.size, input.address
             ))
         })
         .await

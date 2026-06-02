@@ -88,17 +88,21 @@ nothing else to pass.
 
 ## Tools
 
-| Tool | Purpose |
-|------|---------|
-| `flash` | Flash an ELF/binary (no monitor) |
-| `flash_monitor` | Flash, then capture from boot |
-| `rerun` | Reset (no reflash) + capture; `repeat > 1` for flaky-bug runs |
-| `monitor` | Attach + capture only |
-| `chip_info` | Chip type, revision, MAC, flash size (espflash) |
-| `reset_device` | Reset via DTR/RTS (espflash) |
-| `erase_flash` / `erase_region` | Erase flash (destructive, espflash) |
-| `read_flash` / `checksum_md5` | Read / checksum a flash region (espflash) |
-| `list_ports` | Discover serial ports |
+All flash/monitor/device tools work on **both backends** (each using its native
+mechanism); only `list_ports` is serial-specific.
+
+| Tool | Purpose | Backend notes |
+|------|---------|---------------|
+| `flash` | Flash an ELF/binary (no monitor) | espflash: IDF format / raw `flash_address`; probe-rs: flash-algo |
+| `flash_monitor` | Flash, then capture from boot | |
+| `rerun` | Reset (no reflash) + capture; `repeat > 1` for flaky-bug runs | |
+| `monitor` | Attach + capture only | |
+| `reset_device` | Reset the device | espflash: DTR/RTS; probe-rs: core reset |
+| `erase_flash` / `erase_region` | Erase flash (destructive) | espflash: ROM erase (4 KiB-aligned region); probe-rs: flash-algo (sector-covering) |
+| `read_flash` | Read a memory/flash region to a file | espflash: ROM read; probe-rs: debug-port memory read |
+| `chip_info` | Device/target info | espflash: ESP type/revision/MAC/crystal/flash; probe-rs: target name + cores + memory map |
+| `checksum_md5` | MD5 of a region | espflash: on-device ROM MD5; probe-rs: read + host-side hash |
+| `list_ports` | Discover serial ports | espflash/serial only |
 
 ## Capture
 
