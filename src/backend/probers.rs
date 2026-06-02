@@ -12,12 +12,27 @@ use probe_rs::flashing::{
 };
 use probe_rs::probe::DebugProbeInfo;
 use probe_rs::probe::list::Lister;
-use probe_rs::rtt::Rtt;
+use probe_rs::rtt::{ChannelMode, Rtt, ScanRegion};
 use probe_rs::{MemoryInterface, Permissions, Session};
 use std::time::{Duration, Instant};
 
 /// Default RTT up-channel to read (channel 0 is the conventional terminal).
 const RTT_UP_CHANNEL: usize = 0;
+
+/// Address of the `_SEGGER_RTT` control block from the ELF symbol table, if
+/// present. Lets us attach via [`ScanRegion::Exact`] — an instant pointer read
+/// — instead of scanning the whole RAM (which is seconds-slow over SWD on a
+/// large-RAM target like RP2350). This is the same trick probe-rs/cargo-embed
+/// use.
+fn rtt_control_block_addr(elf_path: &str) -> Option<u64> {
+    use object::{Object, ObjectSymbol};
+    let data = std::fs::read(elf_path).ok()?;
+    let file = object::File::parse(&*data).ok()?;
+    file.symbols()
+        .chain(file.dynamic_symbols())
+        .find(|s| s.name() == Ok("_SEGGER_RTT"))
+        .map(|s| s.address())
+}
 
 /// Open a session to `chip` through a connected probe. `probe_sel` optionally
 /// selects a probe by `VID:PID` or `VID:PID:SERIAL` (hex VID/PID). With no
@@ -124,36 +139,57 @@ pub fn reset(session: &mut Session) -> Result<(), String> {
 
 /// Reset the device and attach RTT so capture begins at the *start* of the run.
 ///
-/// Resets-and-halts at the vector (before the firmware runs), zeros any stale
-/// RTT control block left in RAM from the previous run, then runs from the start
-/// and polls until the firmware re-initializes RTT. This guarantees we attach to
-/// the *fresh* control block (read pointer at 0, so the earliest frames are
-/// captured) rather than a fixed delay later — and never latches onto the stale
-/// pre-reset block.
-pub fn reset_and_attach_rtt(mut session: Session) -> Result<RttSource, String> {
+/// Three things have to line up to capture from the first frame:
+///
+/// 1. **Fast attach.** Resolve the control block via the `_SEGGER_RTT` ELF
+///    symbol ([`ScanRegion::Exact`]) so attach is an instant pointer read. The
+///    default whole-RAM scan takes *seconds* over SWD on a large-RAM target
+///    (e.g. ~18 s on RP2350's 520 KB), by which point the firmware has run to
+///    completion and overwritten the buffer.
+/// 2. **No stale block.** Reset-and-halt at the vector, zero the old control
+///    block, then run — so the poll loop can only latch on once the firmware
+///    re-initializes RTT with a fresh read pointer at 0.
+/// 3. **Blocking mode.** defmt-rtt boots the up-channel in `NON_BLOCKING_TRIM`,
+///    an OVERWRITE ring (`nonblocking_write` ignores the read pointer and
+///    clobbers unread data). Switch it to `BlockIfFull` right after attach so
+///    the firmware stalls when the buffer fills instead of discarding the
+///    earliest frames — exactly what probe-rs/cargo-embed do.
+///
+/// If the ELF has no `_SEGGER_RTT` symbol we fall back to the slow RAM scan,
+/// which is correct but may miss early frames on large-RAM targets.
+pub fn reset_and_attach_rtt(
+    mut session: Session,
+    elf_path: Option<&str>,
+) -> Result<RttSource, String> {
+    let region = match elf_path.and_then(rtt_control_block_addr) {
+        Some(addr) => ScanRegion::Exact(addr),
+        None => ScanRegion::Ram,
+    };
+
     {
         let mut core = session
             .core(0)
             .map_err(|e| format!("Failed to access core: {e}"))?;
         core.reset_and_halt(Duration::from_millis(500))
             .map_err(|e| format!("Failed to reset-and-halt: {e}"))?;
-        // Invalidate a stale control block so it can't be mistaken for the fresh
-        // one before the firmware re-initializes RTT.
-        if let Ok(stale) = Rtt::attach(&mut core) {
+        // Invalidate a stale control block (magic + pointers from the previous
+        // run) so the poll loop below can't latch onto it before the firmware
+        // re-initializes RTT with a fresh read pointer at 0.
+        if let Ok(addr) = Rtt::find_contol_block(&mut core, &region) {
             let zeros = vec![0u8; Rtt::control_block_size()];
-            let _ = core.write(stale.ptr(), &zeros);
+            let _ = core.write(addr, &zeros);
         }
         core.run()
             .map_err(|e| format!("Failed to run after reset: {e}"))?;
     }
 
     let deadline = Instant::now() + Duration::from_millis(1500);
-    let rtt = loop {
+    let mut rtt = loop {
         let attached = {
             let mut core = session
                 .core(0)
                 .map_err(|e| format!("Failed to access core: {e}"))?;
-            Rtt::attach(&mut core).ok()
+            Rtt::attach_region(&mut core, &region).ok()
         };
         match attached {
             Some(rtt) => break rtt,
@@ -165,6 +201,18 @@ pub fn reset_and_attach_rtt(mut session: Session) -> Result<RttSource, String> {
             }
         }
     };
+
+    // Switch the up-channel out of defmt-rtt's default overwrite ring into
+    // BlockIfFull (see item 3 above), before the ~1 KB buffer can wrap.
+    {
+        let mut core = session
+            .core(0)
+            .map_err(|e| format!("Failed to access core: {e}"))?;
+        if let Some(up) = rtt.up_channel(RTT_UP_CHANNEL) {
+            up.set_mode(&mut core, ChannelMode::BlockIfFull)
+                .map_err(|e| format!("Failed to set RTT channel to blocking mode: {e}"))?;
+        }
+    }
 
     Ok(RttSource {
         session,

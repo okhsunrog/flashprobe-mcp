@@ -705,6 +705,7 @@ dependencies = [
  "defmt-parser",
  "espflash",
  "md5",
+ "object 0.36.7",
  "probe-rs",
  "regex",
  "rmcp",

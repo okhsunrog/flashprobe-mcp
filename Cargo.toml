@@ -10,6 +10,7 @@ defmt-decoder = "1.1"
 defmt-parser = "1.0"
 espflash = { version = "4.3.0", default-features = false, features = ["serialport"] }
 md5 = "0.8"
+object = { version = "0.36", default-features = false, features = ["read", "std"] }
 probe-rs = { version = "0.31", optional = true }
 regex = "1.12.3"
 rmcp = { version = "0.16.0", features = ["server", "transport-io"] }
