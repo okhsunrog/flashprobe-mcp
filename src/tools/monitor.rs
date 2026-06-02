@@ -4,9 +4,10 @@
 //! from the ELF), then runs the shared capture pipeline. Grouped into the
 //! `capture_router`.
 
-use crate::backend::espflash::{SerialSource, connect_to_device, flash_file};
+use crate::backend::espflash::{SerialSource, connect_to_device, detect_serial_port, flash_file};
 use crate::backend::{BackendKind, parse_backend};
 use crate::capture::decode::load_defmt_table;
+use crate::detect::Detector;
 use crate::capture::filter::{compile_opt_regex, process_capture};
 use crate::capture::render::{RenderOpts, last_nonempty_line, render_block, truncate_line};
 use crate::capture::{
@@ -48,12 +49,13 @@ impl EspflashServer {
                 flush: input.flush,
                 max_bytes: input.max_bytes,
             };
+            let mut det = Detector::new(input.project_dir.as_deref(), input.bin.as_deref());
 
             let (mut source, header, framing): (Box<dyn ByteSource>, String, DefmtFraming) =
                 match parse_backend(input.backend.as_deref())? {
                     BackendKind::Espflash => {
-                        let port = require_port(input.port.as_deref())?;
-                        let src = SerialSource::open(port, input.baud)?;
+                        let port = detect_serial_port(input.port.as_deref())?;
+                        let src = SerialSource::open(&port, input.baud)?;
                         (
                             Box::new(src),
                             format!("Port: {port} @ {} baud", input.baud),
@@ -62,8 +64,8 @@ impl EspflashServer {
                     }
                     #[cfg(feature = "probe-rs")]
                     BackendKind::ProbeRs => {
-                        let chip = require_chip(input.chip.as_deref())?;
-                        let session = probers::open_session(chip, input.probe.as_deref())?;
+                        let chip = det.chip(input.chip.as_deref())?;
+                        let session = probers::open_session(&chip, input.probe.as_deref())?;
                         (
                             Box::new(probers::RttSource::attach(session)?),
                             format!("Probe: {chip} via RTT"),
@@ -72,7 +74,9 @@ impl EspflashServer {
                     }
                 };
 
-            let defmt = load_optional_table(input.elf.as_deref())?;
+            // Auto-detect the ELF for defmt decode (text mode if none found).
+            let elf = det.elf_opt(input.elf.as_deref());
+            let defmt = load_optional_table(elf.as_deref())?;
             let mode = decode_mode(&defmt, framing);
             let (result, stats) = capture(source.as_mut(), &mode, &opts)?;
 
@@ -112,6 +116,9 @@ impl EspflashServer {
                 flush: false, // do not flush: we want the boot output
                 max_bytes: input.max_bytes,
             };
+            let mut det = Detector::new(input.project_dir.as_deref(), input.bin.as_deref());
+            // The file to flash: explicit, else the detected build artifact.
+            let file_path = det.elf(input.file_path.as_deref())?;
 
             let (flash_msg, mut source, header, framing): (
                 String,
@@ -120,10 +127,10 @@ impl EspflashServer {
                 DefmtFraming,
             ) = match parse_backend(input.backend.as_deref())? {
                 BackendKind::Espflash => {
-                    let port = require_port(input.port.as_deref())?;
-                    let file_data = std::fs::read(&input.file_path)
-                        .map_err(|e| format!("Failed to read file '{}': {e}", input.file_path))?;
-                    let mut flasher = connect_to_device(port, input.flash_baud, true)?;
+                    let port = detect_serial_port(input.port.as_deref())?;
+                    let file_data = std::fs::read(&file_path)
+                        .map_err(|e| format!("Failed to read file '{file_path}': {e}"))?;
+                    let mut flasher = connect_to_device(&port, input.flash_baud, true)?;
                     let msg = flash_file(
                         &mut flasher,
                         &file_data,
@@ -135,7 +142,7 @@ impl EspflashServer {
                     // flasher only to release the serial port for the monitor.
                     drop(flasher);
                     std::thread::sleep(Duration::from_millis(100));
-                    let src = SerialSource::open(port, input.monitor_baud)?;
+                    let src = SerialSource::open(&port, input.monitor_baud)?;
                     (
                         msg,
                         Box::new(src),
@@ -145,9 +152,9 @@ impl EspflashServer {
                 }
                 #[cfg(feature = "probe-rs")]
                 BackendKind::ProbeRs => {
-                    let chip = require_chip(input.chip.as_deref())?;
-                    let mut session = probers::open_session(chip, input.probe.as_deref())?;
-                    let msg = probers::flash(&mut session, &input.file_path, chip)?;
+                    let chip = det.chip(input.chip.as_deref())?;
+                    let mut session = probers::open_session(&chip, input.probe.as_deref())?;
+                    let msg = probers::flash(&mut session, &file_path, &chip)?;
                     let src = probers::RttSource::attach(session)?;
                     (
                         msg,
@@ -158,11 +165,11 @@ impl EspflashServer {
                 }
             };
 
-            // Default the defmt ELF to the flashed file when it is an ELF.
+            // The flashed ELF is the defmt source (unless a raw bin was flashed).
             let elf_path = input
                 .elf
                 .clone()
-                .or_else(|| (input.flash_address.is_none()).then(|| input.file_path.clone()));
+                .or_else(|| (input.flash_address.is_none()).then(|| file_path.clone()));
             let defmt = load_optional_table(elf_path.as_deref())?;
             let mode = decode_mode(&defmt, framing);
             let (result, stats) = capture(source.as_mut(), &mode, &opts)?;
@@ -199,23 +206,31 @@ impl EspflashServer {
             let min_level = parse_level_opt(input.level.as_deref())?;
             let stop_on_level = parse_level_opt(input.stop_on_level.as_deref())?;
             let repeat = input.repeat.clamp(1, 50);
-            let backend = parse_backend(input.backend.as_deref())?;
-            let defmt = load_optional_table(input.elf.as_deref())?;
+            let mut det = Detector::new(input.project_dir.as_deref(), input.bin.as_deref());
 
-            let (header, framing) = match &backend {
+            // The resolved connection, reused across repeat cycles.
+            enum Conn {
+                Serial(String),
+                #[cfg(feature = "probe-rs")]
+                Jtag(String),
+            }
+
+            let (header, framing, conn) = match parse_backend(input.backend.as_deref())? {
                 BackendKind::Espflash => {
-                    let port = require_port(input.port.as_deref())?;
-                    (
-                        format!("Port: {port} @ {} baud", input.baud),
-                        DefmtFraming::EspPrintln,
-                    )
+                    let port = detect_serial_port(input.port.as_deref())?;
+                    let header = format!("Port: {port} @ {} baud", input.baud);
+                    (header, DefmtFraming::EspPrintln, Conn::Serial(port))
                 }
                 #[cfg(feature = "probe-rs")]
                 BackendKind::ProbeRs => {
-                    let chip = require_chip(input.chip.as_deref())?;
-                    (format!("Probe: {chip} via RTT"), DefmtFraming::Raw)
+                    let chip = det.chip(input.chip.as_deref())?;
+                    let header = format!("Probe: {chip} via RTT");
+                    (header, DefmtFraming::Raw, Conn::Jtag(chip))
                 }
             };
+
+            let elf = det.elf_opt(input.elf.as_deref());
+            let defmt = load_optional_table(elf.as_deref())?;
 
             // One reset + flush + capture on the selected backend / decode mode.
             let one_cycle = || -> Result<(CaptureResult, Option<DefmtStats>), String> {
@@ -228,9 +243,8 @@ impl EspflashServer {
                     max_bytes: input.max_bytes,
                 };
                 let mode = decode_mode(&defmt, framing);
-                let mut source: Box<dyn ByteSource> = match &backend {
-                    BackendKind::Espflash => {
-                        let port = require_port(input.port.as_deref())?;
+                let mut source: Box<dyn ByteSource> = match &conn {
+                    Conn::Serial(port) => {
                         // No stub, matches reset_device / espflash CLI.
                         let mut flasher = connect_to_device(port, 115_200, false)?;
                         flasher
@@ -242,8 +256,7 @@ impl EspflashServer {
                         Box::new(SerialSource::open(port, input.baud)?)
                     }
                     #[cfg(feature = "probe-rs")]
-                    BackendKind::ProbeRs => {
-                        let chip = require_chip(input.chip.as_deref())?;
+                    Conn::Jtag(chip) => {
                         let mut session = probers::open_session(chip, input.probe.as_deref())?;
                         probers::reset(&mut session)?;
                         Box::new(probers::RttSource::attach(session)?)
@@ -296,17 +309,6 @@ impl EspflashServer {
 
         Ok(CallToolResult::success(vec![Content::text(result)]))
     }
-}
-
-/// The espflash backend needs a serial port.
-fn require_port(port: Option<&str>) -> Result<&str, String> {
-    port.ok_or_else(|| "backend=espflash requires `port`".to_string())
-}
-
-/// The probe-rs backend needs a chip/target name.
-#[cfg(feature = "probe-rs")]
-fn require_chip(chip: Option<&str>) -> Result<&str, String> {
-    chip.ok_or_else(|| "backend=probe-rs requires `chip` (e.g. \"esp32c3\")".to_string())
 }
 
 /// Parse an optional level name (`info`, `error`, …).

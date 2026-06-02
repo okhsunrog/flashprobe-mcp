@@ -16,6 +16,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 serialport = { version = "4.9", features = ["usbportinfo-interface"] }
 tokio = { version = "1.49.0", features = ["full"] }
+toml = "1.1.2"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 

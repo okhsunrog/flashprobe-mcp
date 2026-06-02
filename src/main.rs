@@ -3,6 +3,7 @@
 
 mod backend;
 mod capture;
+mod detect;
 mod esp_noise;
 mod inputs;
 mod server;

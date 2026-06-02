@@ -49,16 +49,21 @@ pub struct ChipInfoInput {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct FlashInput {
-    /// Backend: "espflash" (serial, default) or "probe-rs" (JTAG/SWD).
+    /// Backend (REQUIRED): "probe-rs" (JTAG/SWD) or "espflash" (UART).
     pub backend: Option<String>,
-    /// Serial port path (required for the espflash backend).
+    /// Serial port path (espflash). Auto-detected if exactly one USB port.
     pub port: Option<String>,
-    /// Chip/target name for the probe-rs backend, e.g. "esp32c3", "stm32g431cbtx".
+    /// Chip/target name (probe-rs), e.g. "esp32c6", "stm32g431cbtx".
+    /// Auto-detected from .cargo/config.toml if omitted.
     pub chip: Option<String>,
     /// probe-rs probe selector as VID:PID[:SERIAL] (hex). Omit if only one probe.
     pub probe: Option<String>,
-    /// Path to the ELF or binary file to flash
-    pub file_path: String,
+    /// Project directory for auto-detection (defaults to cwd).
+    pub project_dir: Option<String>,
+    /// Binary name to disambiguate a multi-binary workspace.
+    pub bin: Option<String>,
+    /// Path to the ELF or binary to flash. Auto-detected (the build artifact) if omitted.
+    pub file_path: Option<String>,
     /// Baud rate for flashing (default: 460800). espflash backend only.
     #[serde(default = "default_baud")]
     pub baud: u32,
@@ -132,14 +137,18 @@ pub struct ChecksumMd5Input {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct MonitorInput {
-    /// Backend: "espflash" (serial, default) or "probe-rs" (RTT over JTAG/SWD).
+    /// Backend (REQUIRED): "probe-rs" (RTT over JTAG/SWD) or "espflash" (UART).
     pub backend: Option<String>,
-    /// Serial port path (required for the espflash backend).
+    /// Serial port path (espflash). Auto-detected if exactly one USB port.
     pub port: Option<String>,
-    /// Chip/target name for the probe-rs backend, e.g. "esp32c3", "stm32g431cbtx".
+    /// Chip/target name (probe-rs). Auto-detected from .cargo/config.toml if omitted.
     pub chip: Option<String>,
     /// probe-rs probe selector as VID:PID[:SERIAL] (hex). Omit if only one probe.
     pub probe: Option<String>,
+    /// Project directory for auto-detection (defaults to cwd).
+    pub project_dir: Option<String>,
+    /// Binary name to disambiguate a multi-binary workspace.
+    pub bin: Option<String>,
     /// Baud rate for serial monitoring (default: 115200, the ESP-IDF default).
     /// espflash backend only.
     #[serde(default = "default_monitor_baud")]
@@ -171,9 +180,9 @@ pub struct MonitorInput {
     /// dropped. Applied after cleaning. Useful for full-log captures with no
     /// `stop`, e.g. `grep: "ERROR|WARN"`.
     pub grep: Option<String>,
-    /// Path to the firmware ELF. If it has a `.defmt` section, output is decoded
-    /// as defmt (structured levels/modules); otherwise plain text. The ELF must
-    /// match the running firmware or frames decode to garbage.
+    /// Path to the firmware ELF. Auto-detected (the build artifact) if omitted.
+    /// If it has a `.defmt` section, output is decoded as defmt (structured
+    /// levels/modules); otherwise plain text. Must match the running firmware.
     pub elf: Option<String>,
     /// defmt only: stop on the first frame at or above this level
     /// (trace/debug/info/warn/error) - the "did it panic?" button.
@@ -196,16 +205,21 @@ pub struct MonitorInput {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct FlashMonitorInput {
-    /// Backend: "espflash" (serial, default) or "probe-rs" (flash + RTT).
+    /// Backend (REQUIRED): "probe-rs" (flash + RTT) or "espflash" (flash + UART).
     pub backend: Option<String>,
-    /// Serial port path (required for the espflash backend).
+    /// Serial port path (espflash). Auto-detected if exactly one USB port.
     pub port: Option<String>,
-    /// Chip/target name for the probe-rs backend, e.g. "esp32c3", "stm32g431cbtx".
+    /// Chip/target name (probe-rs). Auto-detected from .cargo/config.toml if omitted.
     pub chip: Option<String>,
     /// probe-rs probe selector as VID:PID[:SERIAL] (hex). Omit if only one probe.
     pub probe: Option<String>,
-    /// Path to the ELF or binary file to flash
-    pub file_path: String,
+    /// Project directory for auto-detection (defaults to cwd).
+    pub project_dir: Option<String>,
+    /// Binary name to disambiguate a multi-binary workspace.
+    pub bin: Option<String>,
+    /// Path to the ELF or binary to flash. Auto-detected (the build artifact) if
+    /// omitted; also used as the defmt ELF for decoding.
+    pub file_path: Option<String>,
     /// Baud rate for flashing (default: 460800). espflash backend only.
     #[serde(default = "default_baud")]
     pub flash_baud: u32,
@@ -255,14 +269,18 @@ pub struct FlashMonitorInput {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RerunInput {
-    /// Backend: "espflash" (serial, default) or "probe-rs" (reset + RTT).
+    /// Backend (REQUIRED): "probe-rs" (reset + RTT) or "espflash" (reset + UART).
     pub backend: Option<String>,
-    /// Serial port path (required for the espflash backend).
+    /// Serial port path (espflash). Auto-detected if exactly one USB port.
     pub port: Option<String>,
-    /// Chip/target name for the probe-rs backend, e.g. "esp32c3", "stm32g431cbtx".
+    /// Chip/target name (probe-rs). Auto-detected from .cargo/config.toml if omitted.
     pub chip: Option<String>,
     /// probe-rs probe selector as VID:PID[:SERIAL] (hex). Omit if only one probe.
     pub probe: Option<String>,
+    /// Project directory for auto-detection (defaults to cwd).
+    pub project_dir: Option<String>,
+    /// Binary name to disambiguate a multi-binary workspace.
+    pub bin: Option<String>,
     /// Baud rate for serial monitoring (default: 115200). espflash backend only.
     #[serde(default = "default_monitor_baud")]
     pub baud: u32,
@@ -285,8 +303,8 @@ pub struct RerunInput {
     pub context: Option<usize>,
     /// Keep only lines matching this (unanchored) regex; applied after cleaning.
     pub grep: Option<String>,
-    /// Path to the firmware ELF for defmt decode. If it has a `.defmt` section,
-    /// output is decoded as defmt; otherwise plain text.
+    /// Path to the firmware ELF for defmt decode. Auto-detected (the build
+    /// artifact) if omitted. `.defmt` section present → defmt, else plain text.
     pub elf: Option<String>,
     /// defmt only: stop on the first frame at or above this level (trace/debug/info/warn/error).
     pub stop_on_level: Option<String>,

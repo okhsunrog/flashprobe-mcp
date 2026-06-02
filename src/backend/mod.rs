@@ -12,11 +12,18 @@ pub enum BackendKind {
     ProbeRs,
 }
 
-/// Resolve the `backend` argument. Defaults to espflash. Selecting probe-rs when
-/// the feature was compiled out is a clear error rather than a silent fallback.
+/// Resolve the `backend` argument. It is required and explicit: both backends
+/// work on ESP chips and the right one depends on where the firmware emits
+/// output (UART vs RTT), which can't be inferred reliably — so the tool asks
+/// rather than silently picking the wrong transport (and showing no logs).
 pub fn parse_backend(s: Option<&str>) -> Result<BackendKind, String> {
     match s.map(str::to_ascii_lowercase).as_deref() {
-        None | Some("espflash") => Ok(BackendKind::Espflash),
+        None => Err(
+            "`backend` is required: \"probe-rs\" (JTAG/SWD + RTT) or \"espflash\" (UART). \
+             Pick probe-rs for RTT/defmt-rtt firmware, espflash for UART/esp-println."
+                .to_string(),
+        ),
+        Some("espflash") => Ok(BackendKind::Espflash),
         Some("probe-rs" | "probers" | "probe_rs") => {
             #[cfg(feature = "probe-rs")]
             {

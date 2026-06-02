@@ -12,6 +12,29 @@ use serialport::{ClearBuffer, SerialPortType};
 use std::path::Path;
 use std::time::Duration;
 
+/// Resolve the serial port: explicit wins; otherwise auto-detect when exactly
+/// one USB serial port is present, else error listing the candidates.
+pub fn detect_serial_port(explicit: Option<&str>) -> Result<String, String> {
+    if let Some(p) = explicit {
+        return Ok(p.to_string());
+    }
+    let ports = serialport::available_ports()
+        .map_err(|e| format!("Failed to enumerate serial ports: {e}"))?;
+    let usb: Vec<String> = ports
+        .iter()
+        .filter(|p| matches!(p.port_type, SerialPortType::UsbPort(_)))
+        .map(|p| p.port_name.clone())
+        .collect();
+    match usb.as_slice() {
+        [one] => Ok(one.clone()),
+        [] => Err("no USB serial ports found; connect a device or pass `port`".to_string()),
+        many => Err(format!(
+            "multiple serial ports ({}); pass `port` to choose one",
+            many.join(", ")
+        )),
+    }
+}
+
 /// Connect to an ESP device over serial and return a connected [`Flasher`].
 pub fn connect_to_device(port_name: &str, baud: u32, use_stub: bool) -> Result<Flasher, String> {
     let ports = serialport::available_ports()

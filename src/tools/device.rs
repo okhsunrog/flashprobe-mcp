@@ -2,8 +2,9 @@
 //! flashing, erasing, reading, reset, and checksums. Grouped into the
 //! `device_router`, combined with the capture tools in `server.rs`.
 
-use crate::backend::espflash::{connect_to_device, flash_file};
+use crate::backend::espflash::{connect_to_device, detect_serial_port, flash_file};
 use crate::backend::{BackendKind, parse_backend};
+use crate::detect::Detector;
 use crate::inputs::*;
 use crate::server::EspflashServer;
 use rmcp::{
@@ -103,15 +104,15 @@ impl EspflashServer {
         Parameters(input): Parameters<FlashInput>,
     ) -> Result<CallToolResult, McpError> {
         let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
+            let mut det = Detector::new(input.project_dir.as_deref(), input.bin.as_deref());
+            // The file to flash: explicit, else the detected build artifact.
+            let file_path = det.elf(input.file_path.as_deref())?;
             let summary = match parse_backend(input.backend.as_deref())? {
                 BackendKind::Espflash => {
-                    let port = input
-                        .port
-                        .as_deref()
-                        .ok_or("backend=espflash requires `port`")?;
-                    let file_data = std::fs::read(&input.file_path)
-                        .map_err(|e| format!("Failed to read file '{}': {e}", input.file_path))?;
-                    let mut flasher = connect_to_device(port, input.baud, true)?;
+                    let port = detect_serial_port(input.port.as_deref())?;
+                    let file_data = std::fs::read(&file_path)
+                        .map_err(|e| format!("Failed to read file '{file_path}': {e}"))?;
+                    let mut flasher = connect_to_device(&port, input.baud, true)?;
                     flash_file(
                         &mut flasher,
                         &file_data,
@@ -122,12 +123,9 @@ impl EspflashServer {
                 }
                 #[cfg(feature = "probe-rs")]
                 BackendKind::ProbeRs => {
-                    let chip = input
-                        .chip
-                        .as_deref()
-                        .ok_or("backend=probe-rs requires `chip` (e.g. \"esp32c3\")")?;
-                    let mut session = probers::open_session(chip, input.probe.as_deref())?;
-                    probers::flash(&mut session, &input.file_path, chip)?
+                    let chip = det.chip(input.chip.as_deref())?;
+                    let mut session = probers::open_session(&chip, input.probe.as_deref())?;
+                    probers::flash(&mut session, &file_path, &chip)?
                 }
             };
             Ok(format!("Successfully {}", lower_first(&summary)))
