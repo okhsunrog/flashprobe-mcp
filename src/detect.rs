@@ -85,7 +85,10 @@ impl<'a> Detector<'a> {
         if let Some(e) = explicit {
             return Some(e.to_string());
         }
-        self.elf_result().as_ref().ok().map(|p| p.display().to_string())
+        self.elf_result()
+            .as_ref()
+            .ok()
+            .map(|p| p.display().to_string())
     }
 
     /// Chip/target name: explicit wins, else the `--chip` from the config runner.
@@ -111,14 +114,19 @@ impl<'a> Detector<'a> {
 pub fn detect_elf(project_dir: Option<&str>, bin: Option<&str>) -> Result<PathBuf, String> {
     let dir = match project_dir {
         Some(d) => PathBuf::from(d),
-        None => std::env::current_dir()
-            .map_err(|e| format!("Failed to get current directory: {e}"))?,
+        None => {
+            std::env::current_dir().map_err(|e| format!("Failed to get current directory: {e}"))?
+        }
     };
 
     let meta = cargo_metadata(&dir)?;
     let bin_name = pick_bin(&meta, bin)?;
     let (triple, _chip) = read_cargo_config(&dir);
-    locate_artifact(Path::new(&meta.target_directory), triple.as_deref(), &bin_name)
+    locate_artifact(
+        Path::new(&meta.target_directory),
+        triple.as_deref(),
+        &bin_name,
+    )
 }
 
 fn cargo_metadata(dir: &Path) -> Result<Metadata, String> {
@@ -233,9 +241,17 @@ mod tests {
     fn parses_build_target_and_chip() {
         let cfg = "[target.riscv32imac-unknown-none-elf]\nrunner = \"probe-rs run --chip=esp32c6\"\n[build]\nrustflags = [\"-C\", \"x\"]\ntarget = \"riscv32imac-unknown-none-elf\"\n";
         let v: toml::Value = toml::from_str(cfg).expect("parse");
-        let triple = v.get("build").and_then(|b| b.get("target")).and_then(|t| t.as_str());
+        let triple = v
+            .get("build")
+            .and_then(|b| b.get("target"))
+            .and_then(|t| t.as_str());
         let chip = v.get("target").and_then(|t| t.as_table()).and_then(|s| {
-            s.values().find_map(|sec| sec.get("runner").and_then(|r| r.as_str()).and_then(|r| super::CHIP_RE.captures(r)).map(|c| c[1].to_string()))
+            s.values().find_map(|sec| {
+                sec.get("runner")
+                    .and_then(|r| r.as_str())
+                    .and_then(|r| super::CHIP_RE.captures(r))
+                    .map(|c| c[1].to_string())
+            })
         });
         assert_eq!(triple, Some("riscv32imac-unknown-none-elf"), "triple");
         assert_eq!(chip.as_deref(), Some("esp32c6"), "chip");

@@ -130,7 +130,9 @@ mod tests {
         assert!(is_boot_noise_line("mode:DIO, clock div:2"));
         assert!(is_boot_noise_line("load:0x3fff0030,len:6384"));
         assert!(is_boot_noise_line("entry 0x40080644"));
-        assert!(is_boot_noise_line("I (585) boot: Loaded app from partition"));
+        assert!(is_boot_noise_line(
+            "I (585) boot: Loaded app from partition"
+        ));
         assert!(is_boot_noise_line(
             "x\u{FFFD}x\u{FFFD}I (277) esp_image: segment 1"
         ));

@@ -15,7 +15,9 @@ pub fn load_defmt_table(elf_path: &str) -> Result<Option<(Table, Vec<u8>)>, Stri
     match Table::parse(&bytes) {
         Ok(Some(table)) => Ok(Some((table, bytes))),
         Ok(None) => Ok(None),
-        Err(e) => Err(format!("Failed to parse defmt table from '{elf_path}': {e}")),
+        Err(e) => Err(format!(
+            "Failed to parse defmt table from '{elf_path}': {e}"
+        )),
     }
 }
 
@@ -321,9 +323,7 @@ fn line_from_frame(
         .map(|loc| loc.module.clone());
 
     let mut text = String::new();
-    if has_timestamp
-        && let Some(ts) = frame.display_timestamp()
-    {
+    if has_timestamp && let Some(ts) = frame.display_timestamp() {
         text.push_str(&ts.to_string());
         text.push(' ');
     }

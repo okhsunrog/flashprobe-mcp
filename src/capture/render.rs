@@ -232,7 +232,15 @@ mod tests {
             StopReason::Idle,
         );
         let opts = defmt_opts(None, None, Some(Level::Info), None);
-        let out = render_block("Probe: x", &r, Some(DefmtStats { decoded: 3, malformed: 0 }), &opts);
+        let out = render_block(
+            "Probe: x",
+            &r,
+            Some(DefmtStats {
+                decoded: 3,
+                malformed: 0,
+            }),
+            &opts,
+        );
         assert!(out.contains("mode: defmt"));
         assert!(out.contains("INFO a") && out.contains("ERROR c"));
         assert!(!out.contains("DEBUG b"));
@@ -252,7 +260,15 @@ mod tests {
             StopReason::Idle,
         );
         let opts = defmt_opts(None, None, None, Some(&re));
-        let out = render_block("Probe: x", &r, Some(DefmtStats { decoded: 3, malformed: 0 }), &opts);
+        let out = render_block(
+            "Probe: x",
+            &r,
+            Some(DefmtStats {
+                decoded: 3,
+                malformed: 0,
+            }),
+            &opts,
+        );
         assert!(out.contains("INFO a"));
         assert!(!out.contains("INFO b") && !out.contains("INFO c"));
     }
@@ -271,7 +287,15 @@ mod tests {
             StopReason::Matched,
         );
         let opts = defmt_opts(Some(&re), Some(1), None, None);
-        let out = render_block("Probe: x", &r, Some(DefmtStats { decoded: 4, malformed: 0 }), &opts);
+        let out = render_block(
+            "Probe: x",
+            &r,
+            Some(DefmtStats {
+                decoded: 4,
+                malformed: 0,
+            }),
+            &opts,
+        );
         assert!(out.contains("INFO 2") && out.contains("ERROR boom"));
         assert!(!out.contains("INFO 1") && !out.contains("after"));
     }
@@ -280,7 +304,15 @@ mod tests {
     fn defmt_warns_on_zero_frames() {
         let r = result(vec![], false, StopReason::Timeout);
         let opts = defmt_opts(None, None, None, None);
-        let out = render_block("Probe: x", &r, Some(DefmtStats { decoded: 0, malformed: 0 }), &opts);
+        let out = render_block(
+            "Probe: x",
+            &r,
+            Some(DefmtStats {
+                decoded: 0,
+                malformed: 0,
+            }),
+            &opts,
+        );
         assert!(out.contains("0 defmt frames decoded"));
         assert!(out.contains("does not match the running firmware"));
     }

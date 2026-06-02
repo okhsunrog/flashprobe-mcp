@@ -7,13 +7,13 @@
 use crate::backend::espflash::{SerialSource, connect_to_device, detect_serial_port, flash_file};
 use crate::backend::{BackendKind, parse_backend};
 use crate::capture::decode::load_defmt_table;
-use crate::detect::Detector;
 use crate::capture::filter::{compile_opt_regex, process_capture};
 use crate::capture::render::{RenderOpts, last_nonempty_line, render_block, truncate_line};
 use crate::capture::{
     ByteSource, CaptureOpts, CaptureResult, DecodeMode, DefmtFraming, DefmtStats, Level, capture,
     raw_text,
 };
+use crate::detect::Detector;
 use crate::inputs::*;
 use crate::server::Server;
 use rmcp::{
@@ -84,8 +84,15 @@ impl Server {
                 &header,
                 &result,
                 stats,
-                &render_opts(&input.strip_boot_noise, input.strip_ansi, stop_re.as_ref(),
-                    input.context, grep_re.as_ref(), min_level, module_re.as_ref()),
+                &render_opts(
+                    &input.strip_boot_noise,
+                    input.strip_ansi,
+                    stop_re.as_ref(),
+                    input.context,
+                    grep_re.as_ref(),
+                    min_level,
+                    module_re.as_ref(),
+                ),
             );
             Ok(format!("## Serial Monitor Output\n\n{block}"))
         })
@@ -179,8 +186,15 @@ impl Server {
                 &header,
                 &result,
                 stats,
-                &render_opts(&input.strip_boot_noise, input.strip_ansi, stop_re.as_ref(),
-                    input.context, grep_re.as_ref(), min_level, module_re.as_ref()),
+                &render_opts(
+                    &input.strip_boot_noise,
+                    input.strip_ansi,
+                    stop_re.as_ref(),
+                    input.context,
+                    grep_re.as_ref(),
+                    min_level,
+                    module_re.as_ref(),
+                ),
             );
             Ok(format!(
                 "## Flash + Monitor\n\n{flash_msg}\n\n### Serial Output\n\n{block}"
@@ -272,8 +286,15 @@ impl Server {
                     &header,
                     &result,
                     stats,
-                    &render_opts(&input.strip_boot_noise, input.strip_ansi, stop_re.as_ref(),
-                        input.context, grep_re.as_ref(), min_level, module_re.as_ref()),
+                    &render_opts(
+                        &input.strip_boot_noise,
+                        input.strip_ansi,
+                        stop_re.as_ref(),
+                        input.context,
+                        grep_re.as_ref(),
+                        min_level,
+                        module_re.as_ref(),
+                    ),
                 );
                 return Ok(format!("## Rerun (reset + monitor)\n\n{block}"));
             }
@@ -294,8 +315,15 @@ impl Server {
                     input.strip_ansi,
                     grep_re.as_ref(),
                 );
-                let tag = if mr.matched { "match" } else { mr.stop_reason.as_str() };
-                rows.push_str(&format!("{i:>2}. [{tag}] {}\n", truncate_line(&summary, 200)));
+                let tag = if mr.matched {
+                    "match"
+                } else {
+                    mr.stop_reason.as_str()
+                };
+                rows.push_str(&format!(
+                    "{i:>2}. [{tag}] {}\n",
+                    truncate_line(&summary, 200)
+                ));
             }
 
             let header = format!(
@@ -372,7 +400,9 @@ fn run_summary(
     grep: Option<&regex::Regex>,
 ) -> String {
     if is_defmt {
-        if mr.matched && let Some(re) = stop_re {
+        if mr.matched
+            && let Some(re) = stop_re
+        {
             return mr
                 .lines
                 .iter()
@@ -393,7 +423,15 @@ fn run_summary(
 
     let raw = raw_text(mr);
     if mr.matched && stop_re.is_some() {
-        process_capture(&raw, strip_boot_noise, strip_ansi, stop_re, true, Some(0), None)
+        process_capture(
+            &raw,
+            strip_boot_noise,
+            strip_ansi,
+            stop_re,
+            true,
+            Some(0),
+            None,
+        )
     } else {
         let clean = process_capture(&raw, strip_boot_noise, strip_ansi, None, false, None, grep);
         last_nonempty_line(&clean)

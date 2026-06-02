@@ -84,7 +84,10 @@ impl Server {
                     if let Some((major, minor)) = info.revision {
                         output.push_str(&format!("- Revision: v{major}.{minor}\n"));
                     }
-                    output.push_str(&format!("- Crystal frequency: {}\n", info.crystal_frequency));
+                    output.push_str(&format!(
+                        "- Crystal frequency: {}\n",
+                        info.crystal_frequency
+                    ));
                     output.push_str(&format!("- Flash size: {}\n", info.flash_size));
                     if let Some(mac) = &info.mac_address {
                         output.push_str(&format!("- MAC address: {mac}\n"));
@@ -257,7 +260,9 @@ impl Server {
                     flasher
                         .read_flash(input.address, input.size, 0x400, 32, output_path.clone())
                         .map_err(|e| format!("Failed to read flash: {e}"))?;
-                    let n = std::fs::metadata(&output_path).map(|m| m.len()).unwrap_or(0);
+                    let n = std::fs::metadata(&output_path)
+                        .map(|m| m.len())
+                        .unwrap_or(0);
                     Ok(format!(
                         "Successfully read 0x{:x} bytes from 0x{:08x} to '{}' ({n} bytes written)",
                         input.size,

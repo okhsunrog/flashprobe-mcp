@@ -49,8 +49,7 @@ pub fn capture(
             framing,
         } => {
             let locations = table.get_locations(elf).ok();
-            let mut decoder =
-                DefmtDecoder::new(table, locations, table.has_timestamp(), *framing);
+            let mut decoder = DefmtDecoder::new(table, locations, table.has_timestamp(), *framing);
             let result = run_capture(source, &mut decoder, opts)?;
             let stats = decoder.stats();
             Ok((result, Some(stats)))
