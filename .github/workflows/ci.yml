@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy-test:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: default (probe-rs)
+            flags: ""
+          - name: espflash-only (no default features)
+            flags: --no-default-features
+    steps:
+      - uses: actions/checkout@v4
+      # probe-rs (udev crate) and espflash (serialport) both link libudev on Linux.
+      - name: Install build deps
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.flags }}
+      - name: Clippy
+        run: cargo clippy --all-targets --locked ${{ matrix.flags }} -- -D warnings
+      - name: Test
+        run: cargo test --locked ${{ matrix.flags }}
