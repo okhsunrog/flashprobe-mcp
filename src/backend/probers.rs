@@ -14,7 +14,7 @@ use probe_rs::probe::DebugProbeInfo;
 use probe_rs::probe::list::Lister;
 use probe_rs::rtt::Rtt;
 use probe_rs::{MemoryInterface, Permissions, Session};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Default RTT up-channel to read (channel 0 is the conventional terminal).
 const RTT_UP_CHANNEL: usize = 0;
@@ -98,28 +98,79 @@ fn format_for_chip(chip: &str) -> Format {
     }
 }
 
-/// Download `path` to the device, then reset-and-run so the firmware executes.
-/// Returns a human-readable summary line.
-pub fn flash(session: &mut Session, path: &str, chip: &str) -> Result<String, String> {
+/// Download `path` to flash (no reset). Returns a human-readable summary.
+pub fn download(session: &mut Session, path: &str, chip: &str) -> Result<String, String> {
     download_file(session, path, format_for_chip(chip))
         .map_err(|e| format!("probe-rs flash failed: {e}"))?;
-    reset(session)?;
     Ok(format!("Flashed {path} to {chip} via probe-rs (JTAG/SWD)"))
 }
 
-/// Reset-and-run the firmware already on the device (the probe-rs equivalent of
-/// `rerun`'s DTR/RTS reset). After reset we briefly wait so the firmware can
-/// re-initialize its RTT control block before a subsequent `RttSource::attach`
-/// reads it — otherwise the attach can latch onto the stale pre-reset block and
-/// return uninitialized buffer contents.
+/// Download then reset-and-run so the firmware executes (no monitoring).
+pub fn flash(session: &mut Session, path: &str, chip: &str) -> Result<String, String> {
+    let summary = download(session, path, chip)?;
+    reset(session)?;
+    Ok(summary)
+}
+
+/// Reset-and-run the firmware (probe-rs equivalent of a DTR/RTS reset).
 pub fn reset(session: &mut Session) -> Result<(), String> {
     session
         .core(0)
         .map_err(|e| format!("Failed to access core: {e}"))?
         .reset()
         .map_err(|e| format!("Failed to reset device: {e}"))?;
-    std::thread::sleep(Duration::from_millis(200));
     Ok(())
+}
+
+/// Reset the device and attach RTT so capture begins at the *start* of the run.
+///
+/// Resets-and-halts at the vector (before the firmware runs), zeros any stale
+/// RTT control block left in RAM from the previous run, then runs from the start
+/// and polls until the firmware re-initializes RTT. This guarantees we attach to
+/// the *fresh* control block (read pointer at 0, so the earliest frames are
+/// captured) rather than a fixed delay later — and never latches onto the stale
+/// pre-reset block.
+pub fn reset_and_attach_rtt(mut session: Session) -> Result<RttSource, String> {
+    {
+        let mut core = session
+            .core(0)
+            .map_err(|e| format!("Failed to access core: {e}"))?;
+        core.reset_and_halt(Duration::from_millis(500))
+            .map_err(|e| format!("Failed to reset-and-halt: {e}"))?;
+        // Invalidate a stale control block so it can't be mistaken for the fresh
+        // one before the firmware re-initializes RTT.
+        if let Ok(stale) = Rtt::attach(&mut core) {
+            let zeros = vec![0u8; Rtt::control_block_size()];
+            let _ = core.write(stale.ptr(), &zeros);
+        }
+        core.run()
+            .map_err(|e| format!("Failed to run after reset: {e}"))?;
+    }
+
+    let deadline = Instant::now() + Duration::from_millis(1500);
+    let rtt = loop {
+        let attached = {
+            let mut core = session
+                .core(0)
+                .map_err(|e| format!("Failed to access core: {e}"))?;
+            Rtt::attach(&mut core).ok()
+        };
+        match attached {
+            Some(rtt) => break rtt,
+            None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+            None => {
+                return Err("RTT control block did not appear within 1.5s after reset \
+                            (is the firmware built with an RTT transport like defmt-rtt?)"
+                    .to_string());
+            }
+        }
+    };
+
+    Ok(RttSource {
+        session,
+        rtt,
+        channel: RTT_UP_CHANNEL,
+    })
 }
 
 /// Erase the entire flash via the flash algorithm.

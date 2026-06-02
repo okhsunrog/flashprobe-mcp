@@ -154,8 +154,9 @@ impl Server {
                 BackendKind::ProbeRs => {
                     let chip = det.chip(input.chip.as_deref())?;
                     let mut session = probers::open_session(&chip, input.probe.as_deref())?;
-                    let msg = probers::flash(&mut session, &file_path, &chip)?;
-                    let src = probers::RttSource::attach(session)?;
+                    let msg = probers::download(&mut session, &file_path, &chip)?;
+                    // Reset + attach RTT so capture starts at the run's beginning.
+                    let src = probers::reset_and_attach_rtt(session)?;
                     (
                         msg,
                         Box::new(src),
@@ -257,9 +258,9 @@ impl Server {
                     }
                     #[cfg(feature = "probe-rs")]
                     Conn::Jtag(chip) => {
-                        let mut session = probers::open_session(chip, input.probe.as_deref())?;
-                        probers::reset(&mut session)?;
-                        Box::new(probers::RttSource::attach(session)?)
+                        let session = probers::open_session(chip, input.probe.as_deref())?;
+                        // Reset + attach RTT so each cycle captures from the start.
+                        Box::new(probers::reset_and_attach_rtt(session)?)
                     }
                 };
                 capture(source.as_mut(), &mode, &opts)
