@@ -10,7 +10,8 @@ use crate::capture::decode::load_defmt_table;
 use crate::capture::filter::{compile_opt_regex, process_capture};
 use crate::capture::render::{RenderOpts, last_nonempty_line, render_block, truncate_line};
 use crate::capture::{
-    ByteSource, CaptureOpts, CaptureResult, DecodeMode, DefmtStats, Level, capture, raw_text,
+    ByteSource, CaptureOpts, CaptureResult, DecodeMode, DefmtFraming, DefmtStats, Level, capture,
+    raw_text,
 };
 use crate::inputs::*;
 use crate::server::EspflashServer;
@@ -48,12 +49,16 @@ impl EspflashServer {
                 max_bytes: input.max_bytes,
             };
 
-            let (mut source, header): (Box<dyn ByteSource>, String) =
+            let (mut source, header, framing): (Box<dyn ByteSource>, String, DefmtFraming) =
                 match parse_backend(input.backend.as_deref())? {
                     BackendKind::Espflash => {
                         let port = require_port(input.port.as_deref())?;
                         let src = SerialSource::open(port, input.baud)?;
-                        (Box::new(src), format!("Port: {port} @ {} baud", input.baud))
+                        (
+                            Box::new(src),
+                            format!("Port: {port} @ {} baud", input.baud),
+                            DefmtFraming::EspPrintln,
+                        )
                     }
                     #[cfg(feature = "probe-rs")]
                     BackendKind::ProbeRs => {
@@ -62,12 +67,13 @@ impl EspflashServer {
                         (
                             Box::new(probers::RttSource::attach(session)?),
                             format!("Probe: {chip} via RTT"),
+                            DefmtFraming::Raw,
                         )
                     }
                 };
 
             let defmt = load_optional_table(input.elf.as_deref())?;
-            let mode = decode_mode(&defmt);
+            let mode = decode_mode(&defmt, framing);
             let (result, stats) = capture(source.as_mut(), &mode, &opts)?;
 
             let block = render_block(
@@ -107,34 +113,50 @@ impl EspflashServer {
                 max_bytes: input.max_bytes,
             };
 
-            let (flash_msg, mut source, header): (String, Box<dyn ByteSource>, String) =
-                match parse_backend(input.backend.as_deref())? {
-                    BackendKind::Espflash => {
-                        let port = require_port(input.port.as_deref())?;
-                        let file_data = std::fs::read(&input.file_path)
-                            .map_err(|e| format!("Failed to read file '{}': {e}", input.file_path))?;
-                        let mut flasher = connect_to_device(port, input.flash_baud, true)?;
-                        let msg = flash_file(
-                            &mut flasher,
-                            &file_data,
-                            input.flash_address,
-                            input.partition_table.as_deref(),
-                            input.bootloader.as_deref(),
-                        )?;
-                        drop(flasher); // release the port; hard reset happens here
-                        std::thread::sleep(Duration::from_millis(100));
-                        let src = SerialSource::open(port, input.monitor_baud)?;
-                        (msg, Box::new(src), format!("Port: {port} @ {} baud", input.monitor_baud))
-                    }
-                    #[cfg(feature = "probe-rs")]
-                    BackendKind::ProbeRs => {
-                        let chip = require_chip(input.chip.as_deref())?;
-                        let mut session = probers::open_session(chip, input.probe.as_deref())?;
-                        let msg = probers::flash(&mut session, &input.file_path, chip)?;
-                        let src = probers::RttSource::attach(session)?;
-                        (msg, Box::new(src), format!("Probe: {chip} via RTT"))
-                    }
-                };
+            let (flash_msg, mut source, header, framing): (
+                String,
+                Box<dyn ByteSource>,
+                String,
+                DefmtFraming,
+            ) = match parse_backend(input.backend.as_deref())? {
+                BackendKind::Espflash => {
+                    let port = require_port(input.port.as_deref())?;
+                    let file_data = std::fs::read(&input.file_path)
+                        .map_err(|e| format!("Failed to read file '{}': {e}", input.file_path))?;
+                    let mut flasher = connect_to_device(port, input.flash_baud, true)?;
+                    let msg = flash_file(
+                        &mut flasher,
+                        &file_data,
+                        input.flash_address,
+                        input.partition_table.as_deref(),
+                        input.bootloader.as_deref(),
+                    )?;
+                    // flash_file already reset the chip into the app; drop the
+                    // flasher only to release the serial port for the monitor.
+                    drop(flasher);
+                    std::thread::sleep(Duration::from_millis(100));
+                    let src = SerialSource::open(port, input.monitor_baud)?;
+                    (
+                        msg,
+                        Box::new(src),
+                        format!("Port: {port} @ {} baud", input.monitor_baud),
+                        DefmtFraming::EspPrintln,
+                    )
+                }
+                #[cfg(feature = "probe-rs")]
+                BackendKind::ProbeRs => {
+                    let chip = require_chip(input.chip.as_deref())?;
+                    let mut session = probers::open_session(chip, input.probe.as_deref())?;
+                    let msg = probers::flash(&mut session, &input.file_path, chip)?;
+                    let src = probers::RttSource::attach(session)?;
+                    (
+                        msg,
+                        Box::new(src),
+                        format!("Probe: {chip} via RTT"),
+                        DefmtFraming::Raw,
+                    )
+                }
+            };
 
             // Default the defmt ELF to the flashed file when it is an ELF.
             let elf_path = input
@@ -142,7 +164,7 @@ impl EspflashServer {
                 .clone()
                 .or_else(|| (input.flash_address.is_none()).then(|| input.file_path.clone()));
             let defmt = load_optional_table(elf_path.as_deref())?;
-            let mode = decode_mode(&defmt);
+            let mode = decode_mode(&defmt, framing);
             let (result, stats) = capture(source.as_mut(), &mode, &opts)?;
 
             let block = render_block(
@@ -180,15 +202,18 @@ impl EspflashServer {
             let backend = parse_backend(input.backend.as_deref())?;
             let defmt = load_optional_table(input.elf.as_deref())?;
 
-            let header = match &backend {
+            let (header, framing) = match &backend {
                 BackendKind::Espflash => {
                     let port = require_port(input.port.as_deref())?;
-                    format!("Port: {port} @ {} baud", input.baud)
+                    (
+                        format!("Port: {port} @ {} baud", input.baud),
+                        DefmtFraming::EspPrintln,
+                    )
                 }
                 #[cfg(feature = "probe-rs")]
                 BackendKind::ProbeRs => {
                     let chip = require_chip(input.chip.as_deref())?;
-                    format!("Probe: {chip} via RTT")
+                    (format!("Probe: {chip} via RTT"), DefmtFraming::Raw)
                 }
             };
 
@@ -202,7 +227,7 @@ impl EspflashServer {
                     flush: true, // start each capture clean
                     max_bytes: input.max_bytes,
                 };
-                let mode = decode_mode(&defmt);
+                let mode = decode_mode(&defmt, framing);
                 let mut source: Box<dyn ByteSource> = match &backend {
                     BackendKind::Espflash => {
                         let port = require_port(input.port.as_deref())?;
@@ -298,10 +323,16 @@ fn load_optional_table(elf: Option<&str>) -> Result<Option<DefmtTable>, String> 
     }
 }
 
-/// Pick the decode mode from a (maybe) loaded defmt table.
-fn decode_mode(defmt: &Option<DefmtTable>) -> DecodeMode<'_> {
+/// Pick the decode mode from a (maybe) loaded defmt table. `framing` selects the
+/// wire format and comes from the backend (serial → esp-println marker framing,
+/// RTT → raw rzCOBS).
+fn decode_mode(defmt: &Option<DefmtTable>, framing: DefmtFraming) -> DecodeMode<'_> {
     match defmt {
-        Some((table, elf)) => DecodeMode::Defmt { table, elf },
+        Some((table, elf)) => DecodeMode::Defmt {
+            table,
+            elf,
+            framing,
+        },
         None => DecodeMode::Text,
     }
 }

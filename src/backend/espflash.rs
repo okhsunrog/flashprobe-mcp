@@ -64,48 +64,51 @@ pub fn flash_file(
     partition_table: Option<&str>,
     bootloader: Option<&str>,
 ) -> Result<String, String> {
-    if let Some(addr) = flash_address {
-        flasher
-            .write_bin_to_flash(addr, file_data, &mut DefaultProgressCallback)
-            .map_err(|e| format!("Failed to write binary to flash: {e}"))?;
-        return Ok(format!(
-            "Flashed {} bytes to 0x{:08x}",
-            file_data.len(),
-            addr
-        ));
-    }
-
     let info = flasher
         .device_info()
         .map_err(|e| format!("Failed to get device info: {e}"))?;
 
-    let flash_data = FlashData::new(
-        FlashSettings::default(),
-        0,    // min_chip_rev
-        None, // mmu_page_size (auto)
-        info.chip,
-        info.crystal_frequency,
-    );
+    let summary = if let Some(addr) = flash_address {
+        flasher
+            .write_bin_to_flash(addr, file_data, &mut DefaultProgressCallback)
+            .map_err(|e| format!("Failed to write binary to flash: {e}"))?;
+        format!("Flashed {} bytes to 0x{:08x}", file_data.len(), addr)
+    } else {
+        let flash_data = FlashData::new(
+            FlashSettings::default(),
+            0,    // min_chip_rev
+            None, // mmu_page_size (auto)
+            info.chip,
+            info.crystal_frequency,
+        );
 
-    let image = IdfBootloaderFormat::new(
-        file_data,
-        &flash_data,
-        partition_table.map(Path::new),
-        bootloader.map(Path::new),
-        None, // partition_table_offset
-        None, // target_app_partition
-    )
-    .map_err(|e| format!("Failed to create flash image: {e}"))?;
+        let image = IdfBootloaderFormat::new(
+            file_data,
+            &flash_data,
+            partition_table.map(Path::new),
+            bootloader.map(Path::new),
+            None, // partition_table_offset
+            None, // target_app_partition
+        )
+        .map_err(|e| format!("Failed to create flash image: {e}"))?;
 
+        flasher
+            .load_image_to_flash(&mut DefaultProgressCallback, ImageFormat::EspIdf(image))
+            .map_err(|e| format!("Failed to flash image: {e}"))?;
+
+        format!("Flashed ELF ({} bytes) to {}", file_data.len(), info.chip)
+    };
+
+    // Reset into the freshly flashed app. espflash has no Drop impl, so dropping
+    // the flasher does NOT reset — the chip would otherwise sit in the download
+    // mode it was flashed in and never run the app. Mirror the espflash CLI,
+    // which calls `reset_after(is_stub, chip)` (we always connect with the stub).
     flasher
-        .load_image_to_flash(&mut DefaultProgressCallback, ImageFormat::EspIdf(image))
-        .map_err(|e| format!("Failed to flash image: {e}"))?;
+        .connection()
+        .reset_after(true, info.chip)
+        .map_err(|e| format!("Failed to reset into app after flash: {e}"))?;
 
-    Ok(format!(
-        "Flashed ELF ({} bytes) to {}",
-        file_data.len(),
-        info.chip
-    ))
+    Ok(summary)
 }
 
 /// A [`ByteSource`] over a raw serial port, used by the capture pipeline. The

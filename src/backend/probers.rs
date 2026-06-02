@@ -100,22 +100,23 @@ fn format_for_chip(chip: &str) -> Format {
 pub fn flash(session: &mut Session, path: &str, chip: &str) -> Result<String, String> {
     download_file(session, path, format_for_chip(chip))
         .map_err(|e| format!("probe-rs flash failed: {e}"))?;
-    session
-        .core(0)
-        .map_err(|e| format!("Failed to access core: {e}"))?
-        .reset()
-        .map_err(|e| format!("Failed to reset after flash: {e}"))?;
+    reset(session)?;
     Ok(format!("Flashed {path} to {chip} via probe-rs (JTAG/SWD)"))
 }
 
 /// Reset-and-run the firmware already on the device (the probe-rs equivalent of
-/// `rerun`'s DTR/RTS reset).
+/// `rerun`'s DTR/RTS reset). After reset we briefly wait so the firmware can
+/// re-initialize its RTT control block before a subsequent `RttSource::attach`
+/// reads it — otherwise the attach can latch onto the stale pre-reset block and
+/// return uninitialized buffer contents.
 pub fn reset(session: &mut Session) -> Result<(), String> {
     session
         .core(0)
         .map_err(|e| format!("Failed to access core: {e}"))?
         .reset()
-        .map_err(|e| format!("Failed to reset device: {e}"))
+        .map_err(|e| format!("Failed to reset device: {e}"))?;
+    std::thread::sleep(Duration::from_millis(200));
+    Ok(())
 }
 
 /// A [`ByteSource`] over an RTT up-channel. Holds the session and re-borrows the

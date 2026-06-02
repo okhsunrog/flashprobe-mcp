@@ -142,12 +142,85 @@ pub struct DefmtStats {
     pub malformed: usize,
 }
 
-/// defmt decoder: feeds bytes to the ELF-derived `StreamDecoder` (which picks
-/// rzCOBS-vs-raw framing from the ELF's encoding metadata, so the same decoder
-/// serves serial and RTT) and renders each frame to a [`Line`] carrying its
-/// level and module. Borrows the `Table` for `'a` via the stream decoder.
+/// How defmt frames are framed on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefmtFraming {
+    /// esp-println over serial: each rzCOBS frame is prefixed with the marker
+    /// `0xFF 0x00` (so frames can be told apart from interleaved ASCII like boot
+    /// logs / `println!`) and terminated with `0x00`. We deframe on the marker
+    /// and decode each frame in isolation; non-defmt bytes are dropped.
+    EspPrintln,
+    /// A raw rzCOBS stream with no marker (defmt-rtt over RTT / probe-rs). Bytes
+    /// feed straight into a persistent stream decoder. Only constructed by the
+    /// probe-rs backend, so it is dead code in an espflash-only build.
+    #[cfg_attr(not(feature = "probe-rs"), allow(dead_code))]
+    Raw,
+}
+
+/// Extracts esp-println defmt frames from a byte stream by the `0xFF 0x00`
+/// start marker / `0x00` end marker. Mirrors espflash's `FrameDelimiter`. Raw
+/// (non-defmt) runs are dropped — in defmt mode we only surface decoded frames.
+struct FrameDelimiter {
+    buffer: Vec<u8>,
+    in_frame: bool,
+}
+
+const FRAME_START: &[u8] = &[0xFF, 0x00];
+
+impl FrameDelimiter {
+    fn new() -> Self {
+        Self {
+            buffer: Vec::new(),
+            in_frame: false,
+        }
+    }
+
+    /// Feed bytes; return the raw bytes of each complete defmt frame found.
+    fn feed(&mut self, bytes: &[u8]) -> Vec<Vec<u8>> {
+        self.buffer.extend_from_slice(bytes);
+        let mut frames = Vec::new();
+        loop {
+            // When inside a frame we look for the `0x00` terminator, skipping any
+            // leading zeros; otherwise we look for the `0xFF 0x00` start marker.
+            let (needle, start): (&[u8], usize) = if self.in_frame {
+                match self.buffer.iter().position(|&b| b != 0) {
+                    Some(p) => (&[0x00], p),
+                    None => break,
+                }
+            } else {
+                (FRAME_START, 0)
+            };
+            let Some(rel) = self.buffer[start..]
+                .windows(needle.len())
+                .position(|w| w == needle)
+            else {
+                break;
+            };
+            let consumed = start + rel + needle.len();
+            if self.in_frame {
+                frames.push(self.buffer[start..start + rel].to_vec());
+            }
+            self.in_frame = !self.in_frame;
+            self.buffer.drain(..consumed);
+        }
+        frames
+    }
+}
+
+enum Framing<'a> {
+    /// Persistent stream decoder for a raw rzCOBS stream (RTT).
+    Raw(Box<dyn StreamDecoder + Send + Sync + 'a>),
+    /// Marker-based deframer for esp-println serial streams.
+    EspPrintln(FrameDelimiter),
+}
+
+/// defmt decoder. In `Raw` framing it feeds bytes to a persistent rzCOBS stream
+/// decoder; in `EspPrintln` framing it deframes on the `0xFF 0x00` marker and
+/// decodes each frame in isolation (so interleaved ASCII never corrupts a
+/// frame). Each decoded frame becomes a [`Line`] carrying its level and module.
 pub struct DefmtDecoder<'a> {
-    sd: Box<dyn StreamDecoder + Send + Sync + 'a>,
+    table: &'a Table,
+    framing: Framing<'a>,
     locations: Option<Locations>,
     has_timestamp: bool,
     decoded: usize,
@@ -156,12 +229,18 @@ pub struct DefmtDecoder<'a> {
 
 impl<'a> DefmtDecoder<'a> {
     pub fn new(
-        sd: Box<dyn StreamDecoder + Send + Sync + 'a>,
+        table: &'a Table,
         locations: Option<Locations>,
         has_timestamp: bool,
+        framing: DefmtFraming,
     ) -> Self {
+        let framing = match framing {
+            DefmtFraming::Raw => Framing::Raw(table.new_stream_decoder()),
+            DefmtFraming::EspPrintln => Framing::EspPrintln(FrameDelimiter::new()),
+        };
         Self {
-            sd,
+            table,
+            framing,
             locations,
             has_timestamp,
             decoded: 0,
@@ -179,46 +258,85 @@ impl<'a> DefmtDecoder<'a> {
 
 impl Decode for DefmtDecoder<'_> {
     fn push(&mut self, bytes: &[u8]) -> Vec<Line> {
-        self.sd.received(bytes);
         let mut out = Vec::new();
-        loop {
-            match self.sd.decode() {
-                Ok(frame) => {
-                    self.decoded += 1;
-                    let level = frame.level().map(Level::from);
-                    let module = self
-                        .locations
-                        .as_ref()
-                        .and_then(|locs| locs.get(&frame.index()))
-                        .map(|loc| loc.module.clone());
-
-                    let mut text = String::new();
-                    if self.has_timestamp
-                        && let Some(ts) = frame.display_timestamp()
-                    {
-                        text.push_str(&ts.to_string());
-                        text.push(' ');
+        match &mut self.framing {
+            Framing::Raw(sd) => {
+                sd.received(bytes);
+                loop {
+                    match sd.decode() {
+                        Ok(frame) => {
+                            self.decoded += 1;
+                            out.push(line_from_frame(
+                                &frame,
+                                self.locations.as_ref(),
+                                self.has_timestamp,
+                            ));
+                        }
+                        // No frame separator yet — wait for more bytes.
+                        Err(DecodeError::UnexpectedEof) => break,
+                        // The stream decoder drains past the bad frame, so keep
+                        // going; it resyncs on the next separator.
+                        Err(DecodeError::Malformed) => self.malformed += 1,
                     }
-                    if let Some(lv) = level {
-                        text.push_str(lv.as_str());
-                        text.push(' ');
-                    }
-                    text.push_str(&frame.display_message().to_string());
-
-                    out.push(Line {
-                        text,
-                        level,
-                        module,
-                    });
                 }
-                // No frame separator yet — wait for more bytes.
-                Err(DecodeError::UnexpectedEof) => break,
-                // The stream decoder drains past the bad frame, so we can keep
-                // going; it resyncs on the next separator.
-                Err(DecodeError::Malformed) => self.malformed += 1,
+            }
+            Framing::EspPrintln(delim) => {
+                // Borrow split: take the frames out first, then decode (needs
+                // &self.table / &self.locations).
+                let frames = delim.feed(bytes);
+                for fb in frames {
+                    // Each esp-println frame is a self-contained rzCOBS frame; feed
+                    // it plus the terminating zero to a fresh decoder.
+                    let mut sd = self.table.new_stream_decoder();
+                    sd.received(&fb);
+                    sd.received(&[0x00]);
+                    match sd.decode() {
+                        Ok(frame) => {
+                            self.decoded += 1;
+                            out.push(line_from_frame(
+                                &frame,
+                                self.locations.as_ref(),
+                                self.has_timestamp,
+                            ));
+                        }
+                        Err(_) => self.malformed += 1,
+                    }
+                }
             }
         }
         out
+    }
+}
+
+/// Free-function form of [`DefmtDecoder::line_from_frame`] to sidestep borrow
+/// conflicts with the `&mut self.framing` in `push`.
+fn line_from_frame(
+    frame: &defmt_decoder::Frame<'_>,
+    locations: Option<&Locations>,
+    has_timestamp: bool,
+) -> Line {
+    let level = frame.level().map(Level::from);
+    let module = locations
+        .and_then(|locs| locs.get(&frame.index()))
+        .map(|loc| loc.module.clone());
+
+    let mut text = String::new();
+    if has_timestamp
+        && let Some(ts) = frame.display_timestamp()
+    {
+        text.push_str(&ts.to_string());
+        text.push(' ');
+    }
+    if let Some(lv) = level {
+        text.push_str(lv.as_str());
+        text.push(' ');
+    }
+    text.push_str(&frame.display_message().to_string());
+
+    Line {
+        text,
+        level,
+        module,
     }
 }
 
@@ -255,6 +373,24 @@ mod tests {
         assert_eq!(d.pending(), None);
         d.push(b"x\n");
         assert_eq!(d.pending(), None);
+    }
+
+    #[test]
+    fn esp_println_framing_extracts_frames_and_drops_text() {
+        // Text before/after a frame is dropped; the rzCOBS frame bytes are extracted.
+        let mut d = FrameDelimiter::new();
+        let frames = d.feed(b"boot log\xFF\x00\x06\x7E\x00more text");
+        assert_eq!(frames, vec![vec![0x06, 0x7E]]);
+    }
+
+    #[test]
+    fn esp_println_framing_spans_feeds_and_back_to_back() {
+        let mut d = FrameDelimiter::new();
+        // A frame split across two feeds isn't emitted until its terminator arrives.
+        assert!(d.feed(b"\xFF\x00fra").is_empty());
+        // Completing frame + a second back-to-back frame.
+        let frames = d.feed(b"me\x00\xFF\x00f2\x00");
+        assert_eq!(frames, vec![b"frame".to_vec(), b"f2".to_vec()]);
     }
 
     #[test]

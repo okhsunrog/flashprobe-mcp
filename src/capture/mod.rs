@@ -11,7 +11,7 @@ pub mod filter;
 pub mod render;
 pub mod source;
 
-pub use decode::{Decode, DefmtDecoder, DefmtStats, Level, Line, TextDecoder};
+pub use decode::{Decode, DefmtDecoder, DefmtFraming, DefmtStats, Level, Line, TextDecoder};
 pub use source::ByteSource;
 
 use defmt_decoder::Table;
@@ -19,9 +19,14 @@ use regex::Regex;
 use std::time::{Duration, Instant};
 
 /// How to decode a capture: plain text, or defmt against a parsed ELF table.
+/// `framing` selects the wire format (esp-println marker vs raw RTT rzCOBS).
 pub enum DecodeMode<'a> {
     Text,
-    Defmt { table: &'a Table, elf: &'a [u8] },
+    Defmt {
+        table: &'a Table,
+        elf: &'a [u8],
+        framing: DefmtFraming,
+    },
 }
 
 /// Run a capture with the decoder selected by `mode`, returning the result and
@@ -38,10 +43,14 @@ pub fn capture(
             let result = run_capture(source, &mut decoder, opts)?;
             Ok((result, None))
         }
-        DecodeMode::Defmt { table, elf } => {
+        DecodeMode::Defmt {
+            table,
+            elf,
+            framing,
+        } => {
             let locations = table.get_locations(elf).ok();
             let mut decoder =
-                DefmtDecoder::new(table.new_stream_decoder(), locations, table.has_timestamp());
+                DefmtDecoder::new(table, locations, table.has_timestamp(), *framing);
             let result = run_capture(source, &mut decoder, opts)?;
             let stats = decoder.stats();
             Ok((result, Some(stats)))
