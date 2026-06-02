@@ -172,25 +172,24 @@ fn pick_bin(meta: &Metadata, bin: Option<&str>) -> Result<String, String> {
     }
 }
 
-/// Pick the build artifact under `target/<triple>/{release,debug}/<bin>`,
-/// preferring the most recently built.
+/// Pick the build artifact at `target/<triple>/release/<bin>`. Only the release
+/// profile is considered: a debug build is essentially never what gets flashed on
+/// embedded (and usually won't fit in flash). Pass an explicit path to flash
+/// anything else (e.g. a debug build).
 fn locate_artifact(target_dir: &Path, triple: Option<&str>, bin: &str) -> Result<PathBuf, String> {
     let base = match triple {
         Some(t) => target_dir.join(t),
         None => target_dir.to_path_buf(),
     };
-    let newest = ["release", "debug"]
-        .iter()
-        .map(|profile| base.join(profile).join(bin))
-        .filter(|p| p.is_file())
-        .max_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
-
-    newest.ok_or_else(|| {
-        format!(
-            "no build artifact for '{bin}' under {} (run `cargo build` first, or pass an explicit path)",
-            base.display()
-        )
-    })
+    let artifact = base.join("release").join(bin);
+    if artifact.is_file() {
+        Ok(artifact)
+    } else {
+        Err(format!(
+            "no release build artifact for '{bin}' at {} (run `cargo build --release` first, or pass an explicit path)",
+            artifact.display()
+        ))
+    }
 }
 
 /// `--chip esp32c6` or `--chip=esp32c6`.
