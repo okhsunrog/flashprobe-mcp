@@ -319,12 +319,21 @@ pub struct RttSource {
 impl RttSource {
     /// Attach RTT on an existing session. The firmware must already be running
     /// (just flashed/reset, or attached live) and built with an RTT transport.
-    pub fn attach(mut session: Session) -> Result<Self, String> {
+    ///
+    /// `elf_path` lets us pin the control block to the `_SEGGER_RTT` symbol
+    /// ([`ScanRegion::Exact`]) — without it, a whole-RAM scan can find STALE
+    /// control blocks left by previous firmware images in uninitialized RAM
+    /// (CCMRAM/SRAM2 on STM32, etc.) and fail with "multiple control blocks".
+    pub fn attach(mut session: Session, elf_path: Option<&str>) -> Result<Self, String> {
+        let region = match elf_path.and_then(rtt_control_block_addr) {
+            Some(addr) => ScanRegion::Exact(addr),
+            None => ScanRegion::Ram,
+        };
         let rtt = {
             let mut core = session
                 .core(0)
                 .map_err(|e| format!("Failed to access core: {e}"))?;
-            Rtt::attach(&mut core).map_err(|e| {
+            Rtt::attach_region(&mut core, &region).map_err(|e| {
                 format!(
                     "Failed to attach RTT (is the firmware running and built with an RTT \
                      transport?): {e}"

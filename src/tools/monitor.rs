@@ -51,6 +51,10 @@ impl Server {
             };
             let mut det = Detector::new(input.project_dir.as_deref(), input.bin.as_deref());
 
+            // ELF is needed both for defmt decode AND (probe-rs) to pin the RTT
+            // control block to `_SEGGER_RTT` — resolve it before the attach.
+            let elf = det.elf_opt(input.elf.as_deref());
+
             let (mut source, header, framing): (Box<dyn ByteSource>, String, DefmtFraming) =
                 match parse_backend(input.backend.as_deref())? {
                     BackendKind::Espflash => {
@@ -67,15 +71,12 @@ impl Server {
                         let chip = det.chip(input.chip.as_deref())?;
                         let session = probers::open_session(&chip, input.probe.as_deref())?;
                         (
-                            Box::new(probers::RttSource::attach(session)?),
+                            Box::new(probers::RttSource::attach(session, elf.as_deref())?),
                             format!("Probe: {chip} via RTT"),
                             DefmtFraming::Raw,
                         )
                     }
                 };
-
-            // Auto-detect the ELF for defmt decode (text mode if none found).
-            let elf = det.elf_opt(input.elf.as_deref());
             let defmt = load_optional_table(elf.as_deref())?;
             let mode = decode_mode(&defmt, framing);
             let (result, stats) = capture(source.as_mut(), &mode, &opts)?;
