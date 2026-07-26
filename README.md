@@ -117,6 +117,10 @@ mechanism); only `list_ports` is serial-specific.
 - **`max_bytes`** — byte cap; stops early and marks the output truncated
   (default `65536`).
 
+For probe-rs boot capture, the server temporarily makes the RTT up-channel
+blocking to preserve the earliest frames, then restores the firmware's original
+channel mode when capture ends.
+
 **Show filters:** `grep` (regex, both modes), `context` (N lines around the
 `stop` match), and defmt-only `level` (minimum to show) / `module` (regex on the
 module path). In defmt mode a suppressed-by-level count reports what a looser

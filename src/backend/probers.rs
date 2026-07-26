@@ -149,11 +149,11 @@ pub fn reset(session: &mut Session) -> Result<(), String> {
 /// 2. **No stale block.** Reset-and-halt at the vector, zero the old control
 ///    block, then run — so the poll loop can only latch on once the firmware
 ///    re-initializes RTT with a fresh read pointer at 0.
-/// 3. **Blocking mode.** defmt-rtt boots the up-channel in `NON_BLOCKING_TRIM`,
-///    an OVERWRITE ring (`nonblocking_write` ignores the read pointer and
-///    clobbers unread data). Switch it to `BlockIfFull` right after attach so
-///    the firmware stalls when the buffer fills instead of discarding the
-///    earliest frames — exactly what probe-rs/cargo-embed do.
+/// 3. **Temporary blocking mode.** defmt-rtt boots the up-channel in a
+///    non-blocking mode. Switch it to `BlockIfFull` while the host is actively
+///    draining the channel so the earliest frames are not discarded. Remember
+///    the firmware-configured mode and restore it when capture ends; otherwise
+///    a later log write can freeze the target once no host is reading RTT.
 ///
 /// If the ELF has no `_SEGGER_RTT` symbol we fall back to the slow RAM scan,
 /// which is correct but may miss early frames on large-RAM targets.
@@ -202,22 +202,28 @@ pub fn reset_and_attach_rtt(
         }
     };
 
-    // Switch the up-channel out of defmt-rtt's default overwrite ring into
-    // BlockIfFull (see item 3 above), before the ~1 KB buffer can wrap.
-    {
+    // Temporarily switch the up-channel to BlockIfFull (see item 3 above),
+    // before the ~1 KB buffer can wrap. RttSource restores this mode on drop.
+    let restore_mode = {
         let mut core = session
             .core(0)
             .map_err(|e| format!("Failed to access core: {e}"))?;
-        if let Some(up) = rtt.up_channel(RTT_UP_CHANNEL) {
-            up.set_mode(&mut core, ChannelMode::BlockIfFull)
-                .map_err(|e| format!("Failed to set RTT channel to blocking mode: {e}"))?;
-        }
-    }
+        let up = rtt
+            .up_channel(RTT_UP_CHANNEL)
+            .ok_or_else(|| format!("RTT up-channel {RTT_UP_CHANNEL} not found"))?;
+        let original_mode = up
+            .mode(&mut core)
+            .map_err(|e| format!("Failed to read RTT channel mode: {e}"))?;
+        up.set_mode(&mut core, ChannelMode::BlockIfFull)
+            .map_err(|e| format!("Failed to set RTT channel to blocking mode: {e}"))?;
+        original_mode
+    };
 
     Ok(RttSource {
         session,
         rtt,
         channel: RTT_UP_CHANNEL,
+        restore_mode: Some(restore_mode),
     })
 }
 
@@ -314,6 +320,8 @@ pub struct RttSource {
     session: Session,
     rtt: Rtt,
     channel: usize,
+    /// Mode to restore after a temporary host-side override.
+    restore_mode: Option<ChannelMode>,
 }
 
 impl RttSource {
@@ -344,7 +352,26 @@ impl RttSource {
             session,
             rtt,
             channel: RTT_UP_CHANNEL,
+            restore_mode: None,
         })
+    }
+
+    fn restore_channel_mode(&mut self) -> Result<(), String> {
+        let Some(mode) = self.restore_mode else {
+            return Ok(());
+        };
+        let mut core = self
+            .session
+            .core(0)
+            .map_err(|e| format!("Failed to access core while restoring RTT mode: {e}"))?;
+        let up = self
+            .rtt
+            .up_channel(self.channel)
+            .ok_or_else(|| format!("RTT up-channel {} not found", self.channel))?;
+        up.set_mode(&mut core, mode)
+            .map_err(|e| format!("Failed to restore RTT channel mode: {e}"))?;
+        self.restore_mode = None;
+        Ok(())
     }
 }
 
@@ -370,5 +397,13 @@ impl ByteSource for RttSource {
 
     fn idle_nap(&self) -> Duration {
         Duration::from_millis(10)
+    }
+}
+
+impl Drop for RttSource {
+    fn drop(&mut self) {
+        if let Err(error) = self.restore_channel_mode() {
+            tracing::warn!("{error}");
+        }
     }
 }
