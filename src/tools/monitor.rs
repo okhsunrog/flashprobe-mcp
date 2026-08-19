@@ -30,7 +30,7 @@ use crate::backend::probers;
 #[tool_router(router = capture_router, vis = "pub(crate)")]
 impl Server {
     #[tool(
-        description = "Read output from a device for a bounded window. Backend (REQUIRED): \"probe-rs\" (RTT) or \"espflash\" (UART). The ELF auto-detects from the project for defmt decode (structured level/module; or pass `elf`); else plain text. Stops on: regex `stop`, `stop_on_level` (defmt), idle_ms, max timeout, or byte cap. Text mode strips boot noise + ANSI and focuses on the `stop` match."
+        description = "Read output from a device for a bounded window. Backend (REQUIRED): \"probe-rs\" (RTT) or \"espflash\" (UART). The ELF auto-detects from the project for defmt decode (structured level/module; or pass `elf`); else plain text. Stops on: regex `stop`, `stop_on_level` (defmt), idle_ms, max timeout, or byte cap. Text mode strips boot noise + ANSI and focuses on the `stop` match. To drive a firmware command interface, set `send` (e.g. \"status\\n\"): it is written to the target after the flush and before reading, so the reply lands in this capture - pair it with `stop` to return the moment the answer arrives."
     )]
     async fn monitor(
         &self,
@@ -48,6 +48,8 @@ impl Server {
                 stop_on_level: parse_level_opt(input.stop_on_level.as_deref())?,
                 flush: input.flush,
                 max_bytes: input.max_bytes,
+                // Parsed up front so a bad escape fails before we touch hardware.
+                send: input.send.as_deref().map(parse_escapes).transpose()?,
             };
             let mut det = Detector::new(input.project_dir.as_deref(), input.bin.as_deref());
 
@@ -79,8 +81,10 @@ impl Server {
                 };
             let defmt = load_optional_table(elf.as_deref())?;
             let mode = decode_mode(&defmt, framing);
+            send_delay(opts.send.as_ref(), input.send_delay_ms);
             let (result, stats) = capture(source.as_mut(), &mode, &opts)?;
 
+            let header = format!("{header}{}", send_note(opts.send.as_ref()));
             let block = render_block(
                 &header,
                 &result,
@@ -105,7 +109,7 @@ impl Server {
     }
 
     #[tool(
-        description = "Flash firmware, then immediately capture output to verify the boot. Backend (REQUIRED): \"probe-rs\" (flash + RTT) or \"espflash\" (flash + UART). File/chip auto-detect from the project; the flashed ELF is the defmt source. Captures from boot. Stops on: regex `stop`, `stop_on_level` (defmt), idle_ms, max timeout, or byte cap."
+        description = "Flash firmware, then immediately capture output to verify the boot. Backend (REQUIRED): \"probe-rs\" (flash + RTT) or \"espflash\" (flash + UART). File/chip auto-detect from the project; the flashed ELF is the defmt source. Captures from boot. Stops on: regex `stop`, `stop_on_level` (defmt), idle_ms, max timeout, or byte cap. `send` writes a command to the target before reading; on a just-flashed device pair it with `send_delay_ms` so the firmware is up first."
     )]
     async fn flash_monitor(
         &self,
@@ -123,6 +127,7 @@ impl Server {
                 stop_on_level: parse_level_opt(input.stop_on_level.as_deref())?,
                 flush: false, // do not flush: we want the boot output
                 max_bytes: input.max_bytes,
+                send: input.send.as_deref().map(parse_escapes).transpose()?,
             };
             let mut det = Detector::new(input.project_dir.as_deref(), input.bin.as_deref());
             // The file to flash: explicit, else the detected build artifact.
@@ -181,8 +186,10 @@ impl Server {
                 .or_else(|| (input.flash_address.is_none()).then(|| file_path.clone()));
             let defmt = load_optional_table(elf_path.as_deref())?;
             let mode = decode_mode(&defmt, framing);
+            send_delay(opts.send.as_ref(), input.send_delay_ms);
             let (result, stats) = capture(source.as_mut(), &mode, &opts)?;
 
+            let header = format!("{header}{}", send_note(opts.send.as_ref()));
             let block = render_block(
                 &header,
                 &result,
@@ -209,7 +216,7 @@ impl Server {
     }
 
     #[tool(
-        description = "Re-run the firmware already on the device: reset (DTR/RTS for espflash, core reset for probe-rs), then capture the fresh boot. Backend (REQUIRED): \"probe-rs\" (RTT) or \"espflash\" (UART). ELF/chip auto-detect from the project for defmt decode. One call instead of reset + monitor. Set repeat > 1 to run N cycles back-to-back for a compact per-run summary - useful for characterizing flaky/intermittent bugs."
+        description = "Re-run the firmware already on the device: reset (DTR/RTS for espflash, core reset for probe-rs), then capture the fresh boot. Backend (REQUIRED): \"probe-rs\" (RTT) or \"espflash\" (UART). ELF/chip auto-detect from the project for defmt decode. One call instead of reset + monitor. Set repeat > 1 to run N cycles back-to-back for a compact per-run summary - useful for characterizing flaky/intermittent bugs. `send` writes a command to the target after each reset (re-sent every cycle), so repeat > 1 also characterizes a flaky command response."
     )]
     async fn rerun(
         &self,
@@ -247,6 +254,8 @@ impl Server {
 
             let elf = det.elf_opt(input.elf.as_deref());
             let defmt = load_optional_table(elf.as_deref())?;
+            // Parsed once; every cycle re-sends it after its own reset.
+            let send = input.send.as_deref().map(parse_escapes).transpose()?;
 
             // One reset + flush + capture on the selected backend / decode mode.
             let one_cycle = || -> Result<(CaptureResult, Option<DefmtStats>), String> {
@@ -257,6 +266,7 @@ impl Server {
                     stop_on_level,
                     flush: true, // start each capture clean
                     max_bytes: input.max_bytes,
+                    send: send.clone(),
                 };
                 let mode = decode_mode(&defmt, framing);
                 let mut source: Box<dyn ByteSource> = match &conn {
@@ -278,8 +288,11 @@ impl Server {
                         Box::new(probers::reset_and_attach_rtt(session, elf.as_deref())?)
                     }
                 };
+                send_delay(opts.send.as_ref(), input.send_delay_ms);
                 capture(source.as_mut(), &mode, &opts)
             };
+
+            let header = format!("{header}{}", send_note(send.as_ref()));
 
             if repeat == 1 {
                 let (result, stats) = one_cycle()?;
@@ -344,6 +357,63 @@ impl Server {
 /// Parse an optional level name (`info`, `error`, …).
 fn parse_level_opt(s: Option<&str>) -> Result<Option<Level>, String> {
     s.map(Level::parse).transpose()
+}
+
+/// Interpret C-style escapes in a `send` payload.
+///
+/// Firmware command interfaces are overwhelmingly line-based, so the payload
+/// has to be able to carry a real newline. A JSON client may send one already
+/// (in which case it arrives here as a literal `\n` byte and passes straight
+/// through), but an agent writing the argument by hand typically emits the two
+/// characters `\` + `n` — this turns those into the byte they mean.
+fn parse_escapes(s: &str) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            let mut buf = [0u8; 4];
+            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push(b'\n'),
+            Some('r') => out.push(b'\r'),
+            Some('t') => out.push(b'\t'),
+            Some('0') => out.push(0),
+            Some('\\') => out.push(b'\\'),
+            Some('x') => {
+                let (Some(hi), Some(lo)) = (chars.next(), chars.next()) else {
+                    return Err("`send`: truncated escape, expected `\\xNN`".into());
+                };
+                let byte = u8::from_str_radix(&format!("{hi}{lo}"), 16)
+                    .map_err(|_| format!("`send`: invalid hex escape `\\x{hi}{lo}`"))?;
+                out.push(byte);
+            }
+            Some(other) => {
+                return Err(format!(
+                    "`send`: unknown escape `\\{other}` (supported: \\n \\r \\t \\0 \\xNN \\\\)"
+                ));
+            }
+            None => return Err("`send`: trailing backslash".into()),
+        }
+    }
+    Ok(out)
+}
+
+/// Pause between the source becoming ready and the send, when there is anything
+/// to send. Gives a just-reset device time to boot: on serial there is no
+/// target-side buffer, so bytes arriving before the firmware's RX is listening
+/// are lost outright.
+fn send_delay(send: Option<&Vec<u8>>, delay_ms: u64) {
+    if send.is_some() && delay_ms > 0 {
+        std::thread::sleep(Duration::from_millis(delay_ms));
+    }
+}
+
+/// Header suffix noting what was sent, so the caller can see it took effect.
+fn send_note(send: Option<&Vec<u8>>) -> String {
+    send.map(|d| format!("\nSent: {} bytes to target", d.len()))
+        .unwrap_or_default()
 }
 
 /// Load a defmt table from an optional ELF path (None → text mode).
@@ -436,5 +506,38 @@ fn run_summary(
     } else {
         let clean = process_capture(&raw, strip_boot_noise, strip_ansi, None, false, None, grep);
         last_nonempty_line(&clean)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_escapes;
+
+    #[test]
+    fn escapes_decode_to_bytes() {
+        assert_eq!(parse_escapes("status\\n").unwrap(), b"status\n");
+        assert_eq!(parse_escapes("a\\r\\n").unwrap(), b"a\r\n");
+        assert_eq!(parse_escapes("\\t\\0").unwrap(), b"\t\0");
+        assert_eq!(parse_escapes("\\x41\\x7f").unwrap(), b"A\x7f");
+        assert_eq!(parse_escapes("c:\\\\tmp").unwrap(), b"c:\\tmp");
+    }
+
+    /// A client that already decoded JSON escapes sends a real newline; it must
+    /// survive untouched rather than being double-processed.
+    #[test]
+    fn real_newline_passes_through() {
+        assert_eq!(parse_escapes("status\n").unwrap(), b"status\n");
+    }
+
+    #[test]
+    fn non_ascii_is_sent_as_utf8() {
+        assert_eq!(parse_escapes("привет").unwrap(), "привет".as_bytes());
+    }
+
+    #[test]
+    fn malformed_escapes_are_rejected() {
+        for bad in ["\\q", "\\", "\\x", "\\x4", "\\xZZ"] {
+            assert!(parse_escapes(bad).is_err(), "should reject {bad:?}");
+        }
     }
 }

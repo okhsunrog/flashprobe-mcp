@@ -127,6 +127,39 @@ module path). In defmt mode a suppressed-by-level count reports what a looser
 `level` would reveal. In text mode, ROM/bootloader boot noise (`strip_boot_noise`)
 and ANSI codes (`strip_ansi`) are stripped by default.
 
+## Sending to the target
+
+The same three tools take `send`, a string written to the device *before* the
+read loop, so a command and its reply fit in one call:
+
+```jsonc
+{ "backend": "probe-rs", "send": "status\n", "stop": "OK|ERR" }
+```
+
+It goes out on the RTT **down-channel 0** (probe-rs) or the serial **TX line**
+(espflash). The escapes `\n` `\r` `\t` `\0` `\xNN` `\\` are interpreted —
+line-based firmware almost always needs the trailing `\n`. Ordering is fixed at
+flush → send → read, so the flush can never eat the reply. Pair it with `stop`
+to return the instant the answer arrives.
+
+`send_delay_ms` (default `0`) waits before sending. Serial has no target-side
+buffer, so bytes that arrive before the firmware's RX is listening are lost —
+give a just-reset or just-flashed device time to boot. RTT needs this less: the
+bytes sit in the target's ring buffer until the firmware reads them.
+
+> **probe-rs needs a firmware down-channel.** `defmt-rtt` declares
+> `max_down_channels = 0`, so it can never receive host input and `send` reports
+> that. Use `rtt-target` with an explicit down-channel; defmt still works there
+> through `set_defmt_channel`:
+>
+> ```rust
+> let channels = rtt_init! {
+>     up:   { 0: { size: 1024, mode: NoBlockSkip, name: "defmt" } },
+>     down: { 0: { size: 64, name: "input" } }
+> };
+> set_defmt_channel(channels.up.0);
+> ```
+
 ## defmt note
 
 defmt decode needs the **exact ELF that's running** — version skew yields

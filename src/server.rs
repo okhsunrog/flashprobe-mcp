@@ -65,7 +65,17 @@ impl ServerHandler for Server {
                  Stops on: `stop` regex match, `stop_on_level` (defmt), idle_ms, max \
                  timeout, or byte cap. Provide an ELF (or let it auto-detect) to decode \
                  defmt — then `level`/`module` filter structurally and a suppressed \
-                 count reports what was hidden. Text mode strips boot noise + ANSI.",
+                 count reports what was hidden. Text mode strips boot noise + ANSI.\n\n\
+                 ## Sending to the target\n\
+                 monitor / flash_monitor / rerun take `send`: a string written to the \
+                 device before reading (probe-rs: RTT down-channel 0; espflash: serial \
+                 TX), so the reply is captured in the same call. Escapes `\\n` `\\r` \
+                 `\\t` `\\0` `\\xNN` are interpreted — line-based firmware usually needs \
+                 a trailing `\\n`. Pair with `stop` to return as soon as the answer \
+                 arrives, and `send_delay_ms` to let a just-reset device boot first.\n\
+                 probe-rs requires the firmware to declare an RTT down-channel: \
+                 `defmt-rtt` does not (max_down_channels = 0), so input needs \
+                 `rtt-target` (defmt still works there via `set_defmt_channel`).",
             )
     }
 }

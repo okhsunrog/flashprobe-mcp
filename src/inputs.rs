@@ -264,6 +264,19 @@ pub struct MonitorInput {
     /// (default: 65536). Guards against reboot-loop floods filling the context.
     #[serde(default = "default_max_bytes")]
     pub max_bytes: usize,
+    /// Send this string to the target once capture starts, before reading — for
+    /// firmware with a command interface (probe-rs: RTT down-channel 0;
+    /// espflash: serial TX). Escapes are interpreted: `\n`, `\r`, `\t`, `\0`,
+    /// `\xNN`, `\\`. Most line-based firmware needs a trailing `\n`.
+    ///
+    /// probe-rs note: the firmware must declare an RTT down-channel. `defmt-rtt`
+    /// does not (max_down_channels = 0) — use `rtt-target` if you need input.
+    pub send: Option<String>,
+    /// Wait this long after the source is ready before sending (default: 0).
+    /// Serial has no target-side buffer, so bytes sent before the firmware's RX
+    /// is listening are lost; give a just-reset device time to boot first.
+    #[serde(default)]
+    pub send_delay_ms: u64,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -328,6 +341,19 @@ pub struct FlashMonitorInput {
     /// Cap on captured bytes; stops early and marks output truncated (default: 65536).
     #[serde(default = "default_max_bytes")]
     pub max_bytes: usize,
+    /// Send this string to the target once capture starts, before reading — for
+    /// firmware with a command interface (probe-rs: RTT down-channel 0;
+    /// espflash: serial TX). Escapes are interpreted: `\n`, `\r`, `\t`, `\0`,
+    /// `\xNN`, `\\`. Most line-based firmware needs a trailing `\n`.
+    ///
+    /// probe-rs note: the firmware must declare an RTT down-channel. `defmt-rtt`
+    /// does not (max_down_channels = 0) — use `rtt-target` if you need input.
+    pub send: Option<String>,
+    /// Wait this long after the source is ready before sending (default: 0).
+    /// Serial has no target-side buffer, so bytes sent before the firmware's RX
+    /// is listening are lost; give a just-reset device time to boot first.
+    #[serde(default)]
+    pub send_delay_ms: u64,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -378,6 +404,19 @@ pub struct RerunInput {
     /// Cap on captured bytes; stops early and marks output truncated (default: 65536).
     #[serde(default = "default_max_bytes")]
     pub max_bytes: usize,
+    /// Send this string to the target once capture starts, before reading — for
+    /// firmware with a command interface (probe-rs: RTT down-channel 0;
+    /// espflash: serial TX). Escapes are interpreted: `\n`, `\r`, `\t`, `\0`,
+    /// `\xNN`, `\\`. Most line-based firmware needs a trailing `\n`.
+    ///
+    /// probe-rs note: the firmware must declare an RTT down-channel. `defmt-rtt`
+    /// does not (max_down_channels = 0) — use `rtt-target` if you need input.
+    pub send: Option<String>,
+    /// Wait this long after the source is ready before sending (default: 0).
+    /// Serial has no target-side buffer, so bytes sent before the firmware's RX
+    /// is listening are lost; give a just-reset device time to boot first.
+    #[serde(default)]
+    pub send_delay_ms: u64,
     /// Number of reset+monitor cycles to run back-to-back (default: 1, max: 50).
     /// With repeat > 1 the result is compact: one line per run (the matched line if
     /// `stop` is set, else the last line) plus a summary counting how many runs

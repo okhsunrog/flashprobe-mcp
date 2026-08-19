@@ -166,4 +166,14 @@ impl ByteSource for SerialSource {
             .clear(ClearBuffer::Input)
             .map_err(std::io::Error::other)
     }
+
+    /// Write to the port's TX line. Unlike RTT there is no target-side buffer to
+    /// back up against — bytes sent before the firmware's UART RX is listening
+    /// are simply lost, which is what `send_delay_ms` exists for.
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        use std::io::Write as _;
+        let n = self.port.write(buf)?;
+        self.port.flush()?;
+        Ok(n)
+    }
 }

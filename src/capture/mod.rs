@@ -92,6 +92,13 @@ pub struct CaptureOpts {
     pub stop_on_level: Option<Level>,
     pub flush: bool,
     pub max_bytes: usize,
+    /// Bytes to send to the target once capture starts (the `send` option).
+    ///
+    /// This lives here, rather than at the call site, purely for ordering: the
+    /// send has to happen *after* [`CaptureOpts::flush`] discards stale input
+    /// but *before* the read loop, or the flush would swallow the very reply we
+    /// are waiting for.
+    pub send: Option<Vec<u8>>,
 }
 
 pub struct CaptureResult {
@@ -133,6 +140,11 @@ pub fn run_capture(
 ) -> Result<CaptureResult, String> {
     if opts.flush {
         let _ = source.flush_input();
+    }
+    // Strictly after the flush (see `CaptureOpts::send`) and before the first
+    // read, so the reply lands inside the capture window.
+    if let Some(data) = &opts.send {
+        source::send_all(source, data)?;
     }
 
     let mut lines: Vec<Line> = Vec::new();
@@ -235,4 +247,107 @@ pub fn run_capture(
         matched: outcome.1,
         truncated: outcome.2,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::capture::source::ByteSource;
+
+    /// Records the order in which the loop touches the source, and replies with
+    /// canned bytes once something has been sent.
+    #[derive(Default)]
+    struct Recorder {
+        ops: Vec<&'static str>,
+        reply: Vec<u8>,
+        replied: bool,
+    }
+
+    impl ByteSource for Recorder {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.replied || self.reply.is_empty() {
+                return Ok(0);
+            }
+            self.replied = true;
+            buf[..self.reply.len()].copy_from_slice(&self.reply);
+            Ok(self.reply.len())
+        }
+        fn flush_input(&mut self) -> std::io::Result<()> {
+            self.ops.push("flush");
+            Ok(())
+        }
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.ops.push("send");
+            Ok(buf.len())
+        }
+    }
+
+    fn opts(flush: bool, send: Option<&[u8]>) -> CaptureOpts {
+        CaptureOpts {
+            timeout: Duration::from_millis(150),
+            idle: Duration::from_millis(50),
+            stop: None,
+            stop_on_level: None,
+            flush,
+            max_bytes: 4096,
+            send: send.map(<[u8]>::to_vec),
+        }
+    }
+
+    /// The whole reason `send` lives in `CaptureOpts`: sending before the flush
+    /// would let the flush discard the reply we are waiting for.
+    #[test]
+    fn send_happens_after_the_flush() {
+        let mut src = Recorder::default();
+        let mut dec = TextDecoder::new();
+        run_capture(&mut src, &mut dec, &opts(true, Some(b"cmd\n"))).unwrap();
+        assert_eq!(src.ops, vec!["flush", "send"]);
+    }
+
+    /// With flush disabled the send still happens, and still before reading.
+    #[test]
+    fn send_happens_without_a_flush() {
+        let mut src = Recorder::default();
+        let mut dec = TextDecoder::new();
+        run_capture(&mut src, &mut dec, &opts(false, Some(b"cmd\n"))).unwrap();
+        assert_eq!(src.ops, vec!["send"]);
+    }
+
+    /// No `send` must leave the write path untouched, so read-only backends keep
+    /// working exactly as before.
+    #[test]
+    fn no_send_never_writes() {
+        let mut src = Recorder::default();
+        let mut dec = TextDecoder::new();
+        run_capture(&mut src, &mut dec, &opts(true, None)).unwrap();
+        assert_eq!(src.ops, vec!["flush"]);
+    }
+
+    /// The reply to a sent command must land inside the capture window.
+    #[test]
+    fn reply_to_the_sent_command_is_captured() {
+        let mut src = Recorder {
+            reply: b"pong\n".to_vec(),
+            ..Default::default()
+        };
+        let mut dec = TextDecoder::new();
+        let result = run_capture(&mut src, &mut dec, &opts(true, Some(b"ping\n"))).unwrap();
+        assert_eq!(raw_text(&result).trim(), "pong");
+    }
+
+    /// A failed send aborts the capture rather than silently reading nothing.
+    #[test]
+    fn failed_send_aborts_the_capture() {
+        struct NoWrite;
+        impl ByteSource for NoWrite {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                Ok(0)
+            }
+        }
+        let mut dec = TextDecoder::new();
+        let Err(err) = run_capture(&mut NoWrite, &mut dec, &opts(false, Some(b"x"))) else {
+            panic!("capture should fail when the payload cannot be delivered");
+        };
+        assert!(err.contains("does not support sending"), "got: {err}");
+    }
 }

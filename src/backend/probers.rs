@@ -19,6 +19,9 @@ use std::time::{Duration, Instant};
 /// Default RTT up-channel to read (channel 0 is the conventional terminal).
 const RTT_UP_CHANNEL: usize = 0;
 
+/// Default RTT down-channel to write (channel 0 is the conventional input).
+const RTT_DOWN_CHANNEL: usize = 0;
+
 /// Address of the `_SEGGER_RTT` control block from the ELF symbol table, if
 /// present. Lets us attach via [`ScanRegion::Exact`] — an instant pointer read
 /// — instead of scanning the whole RAM (which is seconds-slow over SWD on a
@@ -406,6 +409,29 @@ impl ByteSource for RttSource {
         let mut scratch = [0u8; 1024];
         while self.read(&mut scratch)? > 0 {}
         Ok(())
+    }
+
+    /// Push bytes into the RTT down-channel. Non-blocking on the probe-rs side:
+    /// it writes as much as fits in the ring buffer and reports the count, so a
+    /// short write here is backpressure that [`send_all`] retries.
+    ///
+    /// [`send_all`]: crate::capture::source::send_all
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut core = self
+            .session
+            .core(0)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let ch = self.rtt.down_channel(RTT_DOWN_CHANNEL).ok_or_else(|| {
+            std::io::Error::other(format!(
+                "RTT down-channel {RTT_DOWN_CHANNEL} not found: this firmware exposes no \
+                 down-channels, so it cannot receive host input. `defmt-rtt` declares \
+                 max_down_channels = 0; to accept input use `rtt-target` with an explicit \
+                 `rtt_init!` that declares a down-channel (defmt still works via \
+                 `set_defmt_channel` on the up-channel)."
+            ))
+        })?;
+        ch.write(&mut core, buf)
+            .map_err(|e| std::io::Error::other(e.to_string()))
     }
 
     fn idle_nap(&self) -> Duration {
