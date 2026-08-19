@@ -19,7 +19,7 @@ use crate::server::Server;
 use rmcp::{
     ErrorData as McpError,
     handler::server::wrapper::Parameters,
-    model::{CallToolResult, Content},
+    model::{CallToolResult, ContentBlock},
     tool, tool_router,
 };
 use std::time::Duration;
@@ -101,7 +101,7 @@ impl Server {
         .map_err(|e| McpError::internal_error(e.to_string(), None))?
         .map_err(|e| McpError::internal_error(e, None))?;
 
-        Ok(CallToolResult::success(vec![Content::text(result)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(result)]))
     }
 
     #[tool(
@@ -205,7 +205,7 @@ impl Server {
         .map_err(|e| McpError::internal_error(e.to_string(), None))?
         .map_err(|e| McpError::internal_error(e, None))?;
 
-        Ok(CallToolResult::success(vec![Content::text(result)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(result)]))
     }
 
     #[tool(
@@ -337,7 +337,7 @@ impl Server {
         .map_err(|e| McpError::internal_error(e.to_string(), None))?
         .map_err(|e| McpError::internal_error(e, None))?;
 
-        Ok(CallToolResult::success(vec![Content::text(result)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(result)]))
     }
 }
 

@@ -8,7 +8,7 @@
 use crate::capture::ByteSource;
 use probe_rs::config::MemoryRegion;
 use probe_rs::flashing::{
-    ElfOptions, FlashProgress, Format, IdfOptions, download_file, erase, erase_all,
+    ElfLoader, ElfOptions, FlashProgress, ImageLoader, download_file, erase, erase_all,
 };
 use probe_rs::probe::DebugProbeInfo;
 use probe_rs::probe::list::Lister;
@@ -22,16 +22,27 @@ const RTT_UP_CHANNEL: usize = 0;
 /// Address of the `_SEGGER_RTT` control block from the ELF symbol table, if
 /// present. Lets us attach via [`ScanRegion::Exact`] — an instant pointer read
 /// — instead of scanning the whole RAM (which is seconds-slow over SWD on a
-/// large-RAM target like RP2350). This is the same trick probe-rs/cargo-embed
-/// use.
+/// large-RAM target like RP2350).
+///
+/// This is literally the helper cargo-embed attaches with, so we inherit its
+/// symbol-table handling (notably: skip an *undefined* `_SEGGER_RTT`, whose
+/// address would be bogus) instead of maintaining our own ELF parse.
 fn rtt_control_block_addr(elf_path: &str) -> Option<u64> {
-    use object::{Object, ObjectSymbol};
     let data = std::fs::read(elf_path).ok()?;
-    let file = object::File::parse(&*data).ok()?;
-    file.symbols()
-        .chain(file.dynamic_symbols())
-        .find(|s| s.name() == Ok("_SEGGER_RTT"))
-        .map(|s| s.address())
+    probe_rs::rtt::find_rtt_control_block_in_raw_file(&data).ok()?
+}
+
+/// Register Espressif support with probe-rs' global registry.
+///
+/// As of probe-rs 0.32 the core crate ships *no* ESP chip targets at all — the
+/// families, debug sequences, the esp-usb-jtag probe driver and the IDF image
+/// format all live in `probe-rs-espressif` and are pulled in through the plugin
+/// system. Without this call every `chip = "esp..."` request fails at target
+/// lookup, so it has to run before any registry read (i.e. before attaching).
+/// Idempotent: registration appends to global lists, so it must happen once.
+fn register_espressif() {
+    static ESPRESSIF: std::sync::Once = std::sync::Once::new();
+    ESPRESSIF.call_once(probe_rs_espressif::register_plugin);
 }
 
 /// Open a session to `chip` through a connected probe. `probe_sel` optionally
@@ -39,6 +50,8 @@ fn rtt_control_block_addr(elf_path: &str) -> Option<u64> {
 /// selector, a single connected probe is used; multiple probes is an error that
 /// asks the caller to disambiguate.
 pub fn open_session(chip: &str, probe_sel: Option<&str>) -> Result<Session, String> {
+    register_espressif();
+
     let lister = Lister::new();
     let probes = lister.list_all();
     if probes.is_empty() {
@@ -105,11 +118,11 @@ fn list_str(probes: &[DebugProbeInfo]) -> String {
 
 /// probe-rs flashes ESP chips through the IDF bootloader image; everything else
 /// is a straight ELF download.
-fn format_for_chip(chip: &str) -> Format {
+fn format_for_chip(chip: &str) -> Box<dyn ImageLoader> {
     if chip.to_ascii_lowercase().starts_with("esp") {
-        Format::Idf(IdfOptions::default())
+        Box::new(probe_rs_espressif::image_format::IdfLoader::default())
     } else {
-        Format::Elf(ElfOptions::default())
+        Box::new(ElfLoader(ElfOptions::default()))
     }
 }
 
@@ -175,7 +188,7 @@ pub fn reset_and_attach_rtt(
         // Invalidate a stale control block (magic + pointers from the previous
         // run) so the poll loop below can't latch onto it before the firmware
         // re-initializes RTT with a fresh read pointer at 0.
-        if let Ok(addr) = Rtt::find_contol_block(&mut core, &region) {
+        if let Ok(addr) = Rtt::find_control_block(&mut core, &region) {
             let zeros = vec![0u8; Rtt::control_block_size()];
             let _ = core.write(addr, &zeros);
         }
@@ -405,5 +418,56 @@ impl Drop for RttSource {
         if let Err(error) = self.restore_channel_mode() {
             tracing::warn!("{error}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use probe_rs::config::Registry;
+
+    /// probe-rs 0.32 moved all Espressif support out of the core crate, so ESP
+    /// chips only resolve once [`register_espressif`] has run. These assertions
+    /// need no hardware: they exercise the target registry directly, which is
+    /// the exact lookup `open_session` does before it ever touches a probe.
+    #[test]
+    fn espressif_targets_are_registered() {
+        register_espressif();
+        let registry = Registry::from_builtin_families();
+
+        for chip in [
+            "esp32", "esp32c3", "esp32c6", "esp32s3", "esp32h2", "esp32p4",
+        ] {
+            assert!(
+                registry.get_target_by_name(chip).is_ok(),
+                "ESP target '{chip}' missing — is probe-rs-espressif still registered?"
+            );
+        }
+    }
+
+    /// The plugin adds to the registry rather than replacing it; make sure the
+    /// non-ESP targets that probe-rs ships builtin are still reachable.
+    #[test]
+    fn builtin_targets_survive_plugin_registration() {
+        register_espressif();
+        let registry = Registry::from_builtin_families();
+
+        for chip in ["STM32F103C8", "RP2350", "nRF52840_xxAA"] {
+            assert!(
+                registry.get_target_by_name(chip).is_ok(),
+                "builtin target '{chip}' no longer resolves"
+            );
+        }
+    }
+
+    /// ESP chips are flashed as an IDF bootloader image; that image format also
+    /// ships in the plugin crate now, so `format_for_chip` depends on it.
+    #[test]
+    fn idf_image_format_is_registered() {
+        register_espressif();
+        assert!(
+            probe_rs::flashing::image_format("idf").is_some(),
+            "IDF image format missing — ESP flashing would fall back to raw ELF"
+        );
     }
 }

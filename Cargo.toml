@@ -5,25 +5,27 @@ edition = "2024"
 license = "MIT"
 
 [dependencies]
-anyhow = "1.0.102"
+anyhow = "1.0.104"
 defmt-decoder = "1.1"
 defmt-parser = "1.0"
-espflash = { version = "4.3.0", default-features = false, features = ["serialport"] }
+espflash = { version = "4.5.0", default-features = false, features = ["serialport"] }
 md5 = "0.8"
-object = { version = "0.36", default-features = false, features = ["read", "std"] }
-probe-rs = { version = "0.31", optional = true }
-regex = "1.12.3"
-rmcp = { version = "0.16.0", features = ["server", "transport-io"] }
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
+probe-rs = { version = "0.32", optional = true }
+probe-rs-espressif = { version = "0.32", optional = true }
+regex = "1.13.1"
+rmcp = { version = "3.1.3", features = ["server", "transport-io"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 serialport = { version = "4.9", features = ["usbportinfo-interface"] }
-tokio = { version = "1.49.0", features = ["full"] }
-toml = "1.1.2"
+tokio = { version = "1.53.1", features = ["full"] }
+toml = "1.1.4"
 tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [features]
 default = ["probe-rs"]
 # probe-rs backend (JTAG/SWD flashing + RTT). Heavy dep tree; disable with
 # --no-default-features for a lean espflash-only (serial) build.
-probe-rs = ["dep:probe-rs"]
+# Since probe-rs 0.32, Espressif targets/sequences/IDF image format live in the
+# separate probe-rs-espressif crate, so ESP-over-SWD needs both.
+probe-rs = ["dep:probe-rs", "dep:probe-rs-espressif"]

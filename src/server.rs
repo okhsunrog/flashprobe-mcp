@@ -5,7 +5,7 @@
 use rmcp::{
     ServerHandler,
     handler::server::tool::ToolRouter,
-    model::{Implementation, ProtocolVersion, ServerCapabilities, ServerInfo},
+    model::{Implementation, ServerCapabilities, ServerInfo},
     tool_handler,
 };
 
@@ -23,18 +23,19 @@ impl Server {
     }
 }
 
-#[tool_handler]
+#[tool_handler(router = self.tool_router)]
 impl ServerHandler for Server {
+    // The protocol version is left at rmcp's default (the newest revision the
+    // crate implements). rmcp negotiates down to `min(client, server)` on
+    // initialize, so advertising the newest is what lets a modern client use
+    // modern features; pinning an old one would cap *every* client to it.
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            protocol_version: ProtocolVersion::V_2024_11_05,
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            server_info: Implementation {
-                name: env!("CARGO_PKG_NAME").to_string(),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                ..Default::default()
-            },
-            instructions: Some(
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new(
+                env!("CARGO_PKG_NAME"),
+                env!("CARGO_PKG_VERSION"),
+            ))
+            .with_instructions(
                 "Flash + monitor embedded targets over two backends — probe-rs \
                  (JTAG/SWD + RTT; any probe-rs target: STM32, nRF, RP2350, ESP \
                  Xtensa+RISC-V, …) and espflash (UART; ESP only).\n\n\
@@ -64,9 +65,7 @@ impl ServerHandler for Server {
                  Stops on: `stop` regex match, `stop_on_level` (defmt), idle_ms, max \
                  timeout, or byte cap. Provide an ELF (or let it auto-detect) to decode \
                  defmt — then `level`/`module` filter structurally and a suppressed \
-                 count reports what was hidden. Text mode strips boot noise + ANSI."
-                    .into(),
-            ),
-        }
+                 count reports what was hidden. Text mode strips boot noise + ANSI.",
+            )
     }
 }
