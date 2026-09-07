@@ -172,23 +172,47 @@ fn pick_bin(meta: &Metadata, bin: Option<&str>) -> Result<String, String> {
     }
 }
 
-/// Pick the build artifact at `target/<triple>/release/<bin>`. Only the release
-/// profile is considered: a debug build is essentially never what gets flashed on
-/// embedded (and usually won't fit in flash). Pass an explicit path to flash
-/// anything else (e.g. a debug build).
+/// Pick the build artifact for `bin`, preferring whichever profile was built
+/// most recently.
+///
+/// Release is the usual thing to flash, but embedded projects routinely iterate
+/// on a debug build with optimizations turned on (the `esp-generate` template
+/// sets `opt-level = "s"` for the dev profile precisely so it fits and runs).
+/// Only ever looking at `release/` means such a project can never be flashed
+/// without spelling out `file_path` on every call.
+///
+/// Choosing the newer of the two also fails safe: after `cargo build --release`
+/// followed by an edit and a plain `cargo build`, the debug binary is the one
+/// the caller means. Preferring release unconditionally would silently flash the
+/// stale image instead.
 fn locate_artifact(target_dir: &Path, triple: Option<&str>, bin: &str) -> Result<PathBuf, String> {
     let base = match triple {
         Some(t) => target_dir.join(t),
         None => target_dir.to_path_buf(),
     };
-    let artifact = base.join("release").join(bin);
-    if artifact.is_file() {
-        Ok(artifact)
-    } else {
-        Err(format!(
-            "no release build artifact for '{bin}' at {} (run `cargo build --release` first, or pass an explicit path)",
-            artifact.display()
-        ))
+
+    let candidates = ["release", "debug"].map(|profile| (profile, base.join(profile).join(bin)));
+
+    let newest = candidates
+        .iter()
+        .filter(|(_, path)| path.is_file())
+        .filter_map(|(profile, path)| {
+            let mtime = path.metadata().and_then(|m| m.modified()).ok()?;
+            Some((mtime, *profile, path.clone()))
+        })
+        // `max_by_key` keeps the last maximum, and release is listed first, so a
+        // tie resolves to debug. Compare on the profile too, so a tie instead
+        // resolves to release, which is the better default when both are equally
+        // fresh.
+        .max_by_key(|(mtime, profile, _)| (*mtime, *profile == "release"));
+
+    match newest {
+        Some((_, _, path)) => Ok(path),
+        None => Err(format!(
+            "no build artifact for '{bin}' at {} (looked in release/ and debug/; \
+             run `cargo build` or `cargo build --release` first, or pass an explicit path)",
+            base.display()
+        )),
     }
 }
 
@@ -254,5 +278,71 @@ mod tests {
         });
         assert_eq!(triple, Some("riscv32imac-unknown-none-elf"), "triple");
         assert_eq!(chip.as_deref(), Some("esp32c6"), "chip");
+    }
+
+    /// Lays out `target/<triple>/<profile>/app` for each given profile, oldest
+    /// first, so the last one listed is the freshest.
+    fn build_tree(profiles_oldest_first: &[&str]) -> std::path::PathBuf {
+        use std::time::{Duration, SystemTime};
+
+        let root = std::env::temp_dir().join(format!(
+            "flashprobe-artifact-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        for (age, profile) in profiles_oldest_first.iter().rev().enumerate() {
+            let dir = root.join("triple").join(profile);
+            std::fs::create_dir_all(&dir).expect("create profile dir");
+            let file = dir.join("app");
+            std::fs::write(&file, b"elf").expect("write artifact");
+            let mtime = SystemTime::now() - Duration::from_secs(60 * (age as u64 + 1));
+            filetime::set_file_mtime(&file, filetime::FileTime::from_system_time(mtime))
+                .expect("set mtime");
+        }
+
+        root
+    }
+
+    #[test]
+    fn picks_release_when_it_is_the_only_build() {
+        let root = build_tree(&["release"]);
+        let found = super::locate_artifact(&root, Some("triple"), "app").expect("artifact");
+        assert!(found.ends_with("release/app"), "got {}", found.display());
+    }
+
+    #[test]
+    fn picks_debug_when_it_is_the_only_build() {
+        // The case that used to fail outright: embedded projects routinely run a
+        // debug build with optimizations enabled.
+        let root = build_tree(&["debug"]);
+        let found = super::locate_artifact(&root, Some("triple"), "app").expect("artifact");
+        assert!(found.ends_with("debug/app"), "got {}", found.display());
+    }
+
+    #[test]
+    fn picks_the_fresher_build_when_both_exist() {
+        let root = build_tree(&["release", "debug"]);
+        let found = super::locate_artifact(&root, Some("triple"), "app").expect("artifact");
+        assert!(
+            found.ends_with("debug/app"),
+            "a newer debug build must win over a stale release one, got {}",
+            found.display()
+        );
+
+        let root = build_tree(&["debug", "release"]);
+        let found = super::locate_artifact(&root, Some("triple"), "app").expect("artifact");
+        assert!(found.ends_with("release/app"), "got {}", found.display());
+    }
+
+    #[test]
+    fn reports_both_profiles_when_nothing_is_built() {
+        let root = build_tree(&[]);
+        let err = super::locate_artifact(&root, Some("triple"), "app").expect_err("no artifact");
+        assert!(err.contains("release/"), "{err}");
+        assert!(err.contains("debug/"), "{err}");
     }
 }

@@ -4,6 +4,16 @@
 //! from the ELF), then runs the shared capture pipeline. Grouped into the
 //! `capture_router`.
 
+/// How long to wait for the firmware to bring RTT up after a reset.
+///
+/// An ESP32-C5 booting through the ESP-IDF bootloader was measured attaching in
+/// under 200 ms, so the default leaves roughly seven times that as headroom
+/// while still reporting a firmware that never initializes RTT quickly. The
+/// knob exists for a target whose bootloader takes materially longer.
+fn rtt_attach_timeout(ms: Option<u64>) -> std::time::Duration {
+    std::time::Duration::from_millis(ms.unwrap_or(1500))
+}
+
 use crate::backend::espflash::{SerialSource, connect_to_device, detect_serial_port, flash_file};
 use crate::backend::{BackendKind, parse_backend};
 use crate::capture::decode::load_defmt_table;
@@ -73,7 +83,11 @@ impl Server {
                         let chip = det.chip(input.chip.as_deref())?;
                         let session = probers::open_session(&chip, input.probe.as_deref())?;
                         (
-                            Box::new(probers::RttSource::attach(session, elf.as_deref())?),
+                            Box::new(probers::RttSource::attach(
+                                session,
+                                elf.as_deref(),
+                                rtt_attach_timeout(input.rtt_attach_timeout_ms),
+                            )?),
                             format!("Probe: {chip} via RTT"),
                             DefmtFraming::Raw,
                         )
@@ -169,7 +183,11 @@ impl Server {
                     let mut session = probers::open_session(&chip, input.probe.as_deref())?;
                     let msg = probers::download(&mut session, &file_path, &chip)?;
                     // Reset + attach RTT so capture starts at the run's beginning.
-                    let src = probers::reset_and_attach_rtt(session, Some(&file_path))?;
+                    let src = probers::reset_and_attach_rtt(
+                        session,
+                        Some(&file_path),
+                        rtt_attach_timeout(input.rtt_attach_timeout_ms),
+                    )?;
                     (
                         msg,
                         Box::new(src),
@@ -285,7 +303,11 @@ impl Server {
                     Conn::Jtag(chip) => {
                         let session = probers::open_session(chip, input.probe.as_deref())?;
                         // Reset + attach RTT so each cycle captures from the start.
-                        Box::new(probers::reset_and_attach_rtt(session, elf.as_deref())?)
+                        Box::new(probers::reset_and_attach_rtt(
+                            session,
+                            elf.as_deref(),
+                            rtt_attach_timeout(input.rtt_attach_timeout_ms),
+                        )?)
                     }
                 };
                 send_delay(opts.send.as_ref(), input.send_delay_ms);

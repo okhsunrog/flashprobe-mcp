@@ -277,6 +277,10 @@ pub struct MonitorInput {
     /// is listening are lost; give a just-reset device time to boot first.
     #[serde(default)]
     pub send_delay_ms: u64,
+    /// How long to wait after reset for the firmware to initialize RTT, in
+    /// milliseconds (default: 1500). Raise it for a target whose bootloader runs
+    /// for a while before the application starts.
+    pub rtt_attach_timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -354,6 +358,10 @@ pub struct FlashMonitorInput {
     /// is listening are lost; give a just-reset device time to boot first.
     #[serde(default)]
     pub send_delay_ms: u64,
+    /// How long to wait after reset for the firmware to initialize RTT, in
+    /// milliseconds (default: 1500). Raise it for a target whose bootloader runs
+    /// for a while before the application starts.
+    pub rtt_attach_timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -423,4 +431,8 @@ pub struct RerunInput {
     /// matched. Ideal for characterizing intermittent/flaky bugs in one call.
     #[serde(default = "default_repeat")]
     pub repeat: usize,
+    /// How long to wait after reset for the firmware to initialize RTT, in
+    /// milliseconds (default: 1500). Raise it for a target whose bootloader runs
+    /// for a while before the application starts.
+    pub rtt_attach_timeout_ms: Option<u64>,
 }

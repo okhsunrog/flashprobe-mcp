@@ -29,3 +29,6 @@ default = ["probe-rs"]
 # Since probe-rs 0.32, Espressif targets/sequences/IDF image format live in the
 # separate probe-rs-espressif crate, so ESP-over-SWD needs both.
 probe-rs = ["dep:probe-rs", "dep:probe-rs-espressif"]
+
+[dev-dependencies]
+filetime = "0.2.29"

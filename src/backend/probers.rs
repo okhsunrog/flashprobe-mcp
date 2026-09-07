@@ -176,8 +176,10 @@ pub fn reset(session: &mut Session) -> Result<(), String> {
 pub fn reset_and_attach_rtt(
     mut session: Session,
     elf_path: Option<&str>,
+    attach_timeout: Duration,
 ) -> Result<RttSource, String> {
-    let region = match elf_path.and_then(rtt_control_block_addr) {
+    let exact = elf_path.and_then(rtt_control_block_addr);
+    let region = match exact {
         Some(addr) => ScanRegion::Exact(addr),
         None => ScanRegion::Ram,
     };
@@ -199,7 +201,7 @@ pub fn reset_and_attach_rtt(
             .map_err(|e| format!("Failed to run after reset: {e}"))?;
     }
 
-    let deadline = Instant::now() + Duration::from_millis(1500);
+    let deadline = Instant::now() + attach_timeout;
     let mut rtt = loop {
         let attached = {
             let mut core = session
@@ -211,9 +213,32 @@ pub fn reset_and_attach_rtt(
             Some(rtt) => break rtt,
             None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
             None => {
-                return Err("RTT control block did not appear within 1.5s after reset \
-                            (is the firmware built with an RTT transport like defmt-rtt?)"
-                    .to_string());
+                // Say which of the two failure shapes this is: a firmware that
+                // never initializes RTT looks the same as one that simply took
+                // longer to get there, and the fix is different for each.
+                let how = match exact {
+                    Some(addr) => format!(
+                        "`_SEGGER_RTT` resolved to {addr:#x} from the ELF, so the block was \
+                         read directly and the firmware simply never wrote its magic there"
+                    ),
+                    None => "the ELF has no `_SEGGER_RTT` symbol, so this fell back to \
+                             scanning the whole RAM, which is slow on a large-RAM target"
+                        .to_string(),
+                };
+                return Err(format!(
+                    "RTT control block did not appear within {:.1}s after reset: {how}.\n\
+                     Worth checking:\n\
+                     - Is the firmware built with an RTT transport such as defmt-rtt or \
+                       rtt-target, and does it initialize it before any long setup work?\n\
+                     - Does the target boot through a bootloader that runs for longer than \
+                       this? Raise `rtt_attach_timeout_ms`.\n\
+                     - Does the firmware repurpose the debug pins (MTCK/MTDO/MTMS/MTDI)? \
+                       That disturbs reset-and-attach on some targets.\n\
+                     If the debug connection itself looks wedged, reflashing over UART \
+                     with the espflash backend resets the target out of band and has \
+                     recovered it before.",
+                    attach_timeout.as_secs_f32()
+                ));
             }
         }
     };
@@ -348,21 +373,38 @@ impl RttSource {
     /// ([`ScanRegion::Exact`]) — without it, a whole-RAM scan can find STALE
     /// control blocks left by previous firmware images in uninitialized RAM
     /// (CCMRAM/SRAM2 on STM32, etc.) and fail with "multiple control blocks".
-    pub fn attach(mut session: Session, elf_path: Option<&str>) -> Result<Self, String> {
+    pub fn attach(
+        mut session: Session,
+        elf_path: Option<&str>,
+        attach_timeout: Duration,
+    ) -> Result<Self, String> {
         let region = match elf_path.and_then(rtt_control_block_addr) {
             Some(addr) => ScanRegion::Exact(addr),
             None => ScanRegion::Ram,
         };
-        let rtt = {
-            let mut core = session
-                .core(0)
-                .map_err(|e| format!("Failed to access core: {e}"))?;
-            Rtt::attach_region(&mut core, &region).map_err(|e| {
-                format!(
-                    "Failed to attach RTT (is the firmware running and built with an RTT \
-                     transport?): {e}"
-                )
-            })?
+        // Retry rather than give up on the first miss: the target may have been
+        // reset by hand a moment ago and still be in its bootloader.
+        let deadline = Instant::now() + attach_timeout;
+        let rtt = loop {
+            let attached = {
+                let mut core = session
+                    .core(0)
+                    .map_err(|e| format!("Failed to access core: {e}"))?;
+                Rtt::attach_region(&mut core, &region)
+            };
+            match attached {
+                Ok(rtt) => break rtt,
+                Err(_) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "Failed to attach RTT within {:.1}s (is the firmware running and \
+                         built with an RTT transport?): {e}",
+                        attach_timeout.as_secs_f32()
+                    ));
+                }
+            }
         };
         Ok(Self {
             session,
