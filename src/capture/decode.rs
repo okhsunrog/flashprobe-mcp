@@ -149,8 +149,9 @@ pub struct DefmtStats {
 pub enum DefmtFraming {
     /// esp-println over serial: each rzCOBS frame is prefixed with the marker
     /// `0xFF 0x00` (so frames can be told apart from interleaved ASCII like boot
-    /// logs / `println!`) and terminated with `0x00`. We deframe on the marker
-    /// and decode each frame in isolation; non-defmt bytes are dropped.
+    /// logs / `println!`) and terminated with `0x00`. We deframe on the marker,
+    /// decode each frame in isolation, and surface the bytes between frames as
+    /// plain text lines.
     EspPrintln,
     /// A raw rzCOBS stream with no marker (defmt-rtt over RTT / probe-rs). Bytes
     /// feed straight into a persistent stream decoder. Only constructed by the
@@ -159,9 +160,22 @@ pub enum DefmtFraming {
     Raw,
 }
 
+/// A run of bytes the delimiter has classified.
+enum Chunk {
+    /// A complete rzCOBS defmt frame, without its markers.
+    Frame(Vec<u8>),
+    /// Bytes outside any frame: boot ROM output, the bootloader log, `println!`.
+    Text(Vec<u8>),
+}
+
 /// Extracts esp-println defmt frames from a byte stream by the `0xFF 0x00`
-/// start marker / `0x00` end marker. Mirrors espflash's `FrameDelimiter`. Raw
-/// (non-defmt) runs are dropped — in defmt mode we only surface decoded frames.
+/// start marker / `0x00` end marker. Mirrors espflash's `FrameDelimiter`.
+///
+/// Bytes between frames are returned as [`Chunk::Text`] rather than discarded.
+/// A serial stream routinely carries both: the ROM and the ESP-IDF bootloader
+/// print plain text long before the application's first defmt frame, and
+/// dropping it makes a target that fails early look like a target that said
+/// nothing at all.
 struct FrameDelimiter {
     buffer: Vec<u8>,
     in_frame: bool,
@@ -177,10 +191,10 @@ impl FrameDelimiter {
         }
     }
 
-    /// Feed bytes; return the raw bytes of each complete defmt frame found.
-    fn feed(&mut self, bytes: &[u8]) -> Vec<Vec<u8>> {
+    /// Feed bytes; return the frames and the interleaved text, in stream order.
+    fn feed(&mut self, bytes: &[u8]) -> Vec<Chunk> {
         self.buffer.extend_from_slice(bytes);
-        let mut frames = Vec::new();
+        let mut out = Vec::new();
         loop {
             // When inside a frame we look for the `0x00` terminator, skipping any
             // leading zeros; otherwise we look for the `0xFF 0x00` start marker.
@@ -192,20 +206,39 @@ impl FrameDelimiter {
             } else {
                 (FRAME_START, 0)
             };
-            let Some(rel) = self.buffer[start..]
+
+            let found = self.buffer[start..]
                 .windows(needle.len())
-                .position(|w| w == needle)
-            else {
+                .position(|w| w == needle);
+
+            let Some(rel) = found else {
+                if !self.in_frame {
+                    // No frame is starting in what we hold. Release it as text
+                    // now rather than waiting for a marker that may never come:
+                    // a target that only ever prints text would otherwise stay
+                    // silent forever. Keep a trailing `0xFF`, which may yet turn
+                    // out to be the first half of a start marker.
+                    let keep = usize::from(self.buffer.last() == Some(&FRAME_START[0]));
+                    let upto = self.buffer.len() - keep;
+                    if upto > 0 {
+                        out.push(Chunk::Text(self.buffer[..upto].to_vec()));
+                        self.buffer.drain(..upto);
+                    }
+                }
                 break;
             };
+
             let consumed = start + rel + needle.len();
             if self.in_frame {
-                frames.push(self.buffer[start..start + rel].to_vec());
+                out.push(Chunk::Frame(self.buffer[start..start + rel].to_vec()));
+            } else if rel > 0 {
+                // Text that preceded this frame's start marker.
+                out.push(Chunk::Text(self.buffer[..rel].to_vec()));
             }
             self.in_frame = !self.in_frame;
             self.buffer.drain(..consumed);
         }
-        frames
+        out
     }
 }
 
@@ -227,6 +260,8 @@ pub struct DefmtDecoder<'a> {
     has_timestamp: bool,
     decoded: usize,
     malformed: usize,
+    /// Partial interleaved text line, awaiting its newline.
+    text: String,
 }
 
 impl<'a> DefmtDecoder<'a> {
@@ -247,6 +282,7 @@ impl<'a> DefmtDecoder<'a> {
             has_timestamp,
             decoded: 0,
             malformed: 0,
+            text: String::new(),
         }
     }
 
@@ -259,6 +295,10 @@ impl<'a> DefmtDecoder<'a> {
 }
 
 impl Decode for DefmtDecoder<'_> {
+    fn pending(&self) -> Option<&str> {
+        (!self.text.is_empty()).then_some(self.text.as_str())
+    }
+
     fn push(&mut self, bytes: &[u8]) -> Vec<Line> {
         let mut out = Vec::new();
         match &mut self.framing {
@@ -283,25 +323,43 @@ impl Decode for DefmtDecoder<'_> {
                 }
             }
             Framing::EspPrintln(delim) => {
-                // Borrow split: take the frames out first, then decode (needs
+                // Borrow split: take the chunks out first, then decode (needs
                 // &self.table / &self.locations).
-                let frames = delim.feed(bytes);
-                for fb in frames {
-                    // Each esp-println frame is a self-contained rzCOBS frame; feed
-                    // it plus the terminating zero to a fresh decoder.
-                    let mut sd = self.table.new_stream_decoder();
-                    sd.received(&fb);
-                    sd.received(&[0x00]);
-                    match sd.decode() {
-                        Ok(frame) => {
-                            self.decoded += 1;
-                            out.push(line_from_frame(
-                                &frame,
-                                self.locations.as_ref(),
-                                self.has_timestamp,
-                            ));
+                let chunks = delim.feed(bytes);
+                for chunk in chunks {
+                    match chunk {
+                        Chunk::Frame(fb) => {
+                            // Each esp-println frame is a self-contained rzCOBS
+                            // frame; feed it plus the terminating zero to a
+                            // fresh decoder.
+                            let mut sd = self.table.new_stream_decoder();
+                            sd.received(&fb);
+                            sd.received(&[0x00]);
+                            match sd.decode() {
+                                Ok(frame) => {
+                                    self.decoded += 1;
+                                    out.push(line_from_frame(
+                                        &frame,
+                                        self.locations.as_ref(),
+                                        self.has_timestamp,
+                                    ));
+                                }
+                                Err(_) => self.malformed += 1,
+                            }
                         }
-                        Err(_) => self.malformed += 1,
+                        Chunk::Text(bytes) => {
+                            // Interleaved plain text, split into lines the same
+                            // way the text decoder does. Carries no level or
+                            // module, so level filters leave it alone.
+                            self.text.push_str(&String::from_utf8_lossy(&bytes));
+                            while let Some(nl) = self.text.find('\n') {
+                                let line: String = self.text.drain(..=nl).collect();
+                                let line = line.trim_end_matches('\n');
+                                if !line.is_empty() {
+                                    out.push(Line::text(line));
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -376,11 +434,28 @@ mod tests {
     }
 
     #[test]
-    fn esp_println_framing_extracts_frames_and_drops_text() {
-        // Text before/after a frame is dropped; the rzCOBS frame bytes are extracted.
+    fn esp_println_framing_extracts_frames_and_keeps_text() {
+        // The rzCOBS frame bytes are extracted, and the text on either side of
+        // it is kept rather than dropped.
         let mut d = FrameDelimiter::new();
-        let frames = d.feed(b"boot log\xFF\x00\x06\x7E\x00more text");
-        assert_eq!(frames, vec![vec![0x06, 0x7E]]);
+        assert_eq!(
+            chunks(d.feed(b"boot log\xFF\x00\x06\x7E\x00more text")),
+            vec![
+                ("text", b"boot log".to_vec()),
+                ("frame", vec![0x06, 0x7E]),
+                ("text", b"more text".to_vec()),
+            ]
+        );
+    }
+
+    /// Renders chunks compactly so a test failure shows what actually came out.
+    fn chunks(cs: Vec<Chunk>) -> Vec<(&'static str, Vec<u8>)> {
+        cs.into_iter()
+            .map(|c| match c {
+                Chunk::Frame(b) => ("frame", b),
+                Chunk::Text(b) => ("text", b),
+            })
+            .collect()
     }
 
     #[test]
@@ -389,8 +464,70 @@ mod tests {
         // A frame split across two feeds isn't emitted until its terminator arrives.
         assert!(d.feed(b"\xFF\x00fra").is_empty());
         // Completing frame + a second back-to-back frame.
-        let frames = d.feed(b"me\x00\xFF\x00f2\x00");
-        assert_eq!(frames, vec![b"frame".to_vec(), b"f2".to_vec()]);
+        assert_eq!(
+            chunks(d.feed(b"me\x00\xFF\x00f2\x00")),
+            vec![
+                ("frame", b"frame".to_vec()),
+                ("frame", b"f2".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn text_before_a_frame_is_kept() {
+        let mut d = FrameDelimiter::new();
+        // What a serial line actually carries: bootloader output, then defmt.
+        assert_eq!(
+            chunks(d.feed(b"boot: hello\n\xFF\x00frame\x00")),
+            vec![
+                ("text", b"boot: hello\n".to_vec()),
+                ("frame", b"frame".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn text_flows_without_waiting_for_a_frame() {
+        // The regression this guards: a target that only ever prints text used
+        // to stay silent, because the delimiter held everything back waiting
+        // for a start marker that never arrived.
+        let mut d = FrameDelimiter::new();
+        assert_eq!(
+            chunks(d.feed(b"ESP-ROM:esp32c5\n")),
+            vec![("text", b"ESP-ROM:esp32c5\n".to_vec())]
+        );
+    }
+
+    #[test]
+    fn a_trailing_marker_byte_is_held_back() {
+        let mut d = FrameDelimiter::new();
+        // The final 0xFF may be the first half of a start marker, so it must not
+        // be released as text yet.
+        assert_eq!(
+            chunks(d.feed(b"abc\xFF")),
+            vec![("text", b"abc".to_vec())]
+        );
+        // Next feed completes the marker: the frame is found and no stray 0xFF
+        // leaks into the text.
+        assert_eq!(
+            chunks(d.feed(b"\x00frame\x00")),
+            vec![("frame", b"frame".to_vec())]
+        );
+    }
+
+    #[test]
+    fn text_and_frames_keep_their_order() {
+        let mut d = FrameDelimiter::new();
+        assert_eq!(
+            chunks(d.feed(b"a\n\xFF\x00f1\x00b\n\xFF\x00f2\x00c\n")),
+            vec![
+                ("text", b"a\n".to_vec()),
+                ("frame", b"f1".to_vec()),
+                ("text", b"b\n".to_vec()),
+                ("frame", b"f2".to_vec()),
+                ("text", b"c\n".to_vec()),
+            ]
+        );
     }
 
     #[test]

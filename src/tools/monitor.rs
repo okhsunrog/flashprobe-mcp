@@ -283,11 +283,17 @@ impl Server {
                     idle: Duration::from_millis(input.idle_ms),
                     stop: stop_re.clone(),
                     stop_on_level,
-                    // RTT reset-and-attach already invalidates the old control
-                    // block. Flushing here would discard this boot's early
-                    // frames (or the entire log for short-lived output).
-                    // Keep the existing serial input cleanup behavior.
-                    flush: matches!(&conn, Conn::Serial(_)),
+                    // Never flush here. Every cycle has just reset the target,
+                    // so everything buffered is this boot's output — which is
+                    // exactly what the caller asked to see. Discarding it loses
+                    // the early frames, or the whole log for a target that
+                    // prints once and goes quiet.
+                    //
+                    // This holds for both backends. On RTT the reset-and-attach
+                    // already invalidated the old control block; on serial the
+                    // port is opened after the reset, so there is no stale
+                    // input left to clean up either.
+                    flush: false,
                     max_bytes: input.max_bytes,
                     send: send.clone(),
                 };
