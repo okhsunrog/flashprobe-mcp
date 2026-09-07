@@ -238,8 +238,14 @@ mod tests {
         // Nothing arrived even though the target was reset. Suggesting `rerun`
         // here would be circular, since `rerun` is what produced this.
         let after_reset = empty_body(0, false, true);
-        assert!(after_reset.contains("nothing was received"), "{after_reset}");
-        assert!(after_reset.contains("reset and still sent nothing"), "{after_reset}");
+        assert!(
+            after_reset.contains("nothing was received"),
+            "{after_reset}"
+        );
+        assert!(
+            after_reset.contains("reset and still sent nothing"),
+            "{after_reset}"
+        );
         assert!(!after_reset.contains("use `rerun`"), "{after_reset}");
 
         // Bytes arrived and the filters emptied the output.

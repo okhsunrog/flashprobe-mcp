@@ -466,10 +466,7 @@ mod tests {
         // Completing frame + a second back-to-back frame.
         assert_eq!(
             chunks(d.feed(b"me\x00\xFF\x00f2\x00")),
-            vec![
-                ("frame", b"frame".to_vec()),
-                ("frame", b"f2".to_vec()),
-            ]
+            vec![("frame", b"frame".to_vec()), ("frame", b"f2".to_vec()),]
         );
     }
 
@@ -503,10 +500,7 @@ mod tests {
         let mut d = FrameDelimiter::new();
         // The final 0xFF may be the first half of a start marker, so it must not
         // be released as text yet.
-        assert_eq!(
-            chunks(d.feed(b"abc\xFF")),
-            vec![("text", b"abc".to_vec())]
-        );
+        assert_eq!(chunks(d.feed(b"abc\xFF")), vec![("text", b"abc".to_vec())]);
         // Next feed completes the marker: the frame is found and no stray 0xFF
         // leaks into the text.
         assert_eq!(
