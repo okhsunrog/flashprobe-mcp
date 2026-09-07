@@ -105,6 +105,8 @@ impl Server {
                 &result,
                 stats,
                 &render_opts(
+                    // monitor attaches to a running target.
+                    false,
                     &input.strip_boot_noise,
                     input.strip_ansi,
                     stop_re.as_ref(),
@@ -214,6 +216,8 @@ impl Server {
                 &result,
                 stats,
                 &render_opts(
+                    // flash_monitor resets as part of flashing.
+                    true,
                     &input.strip_boot_noise,
                     input.strip_ansi,
                     stop_re.as_ref(),
@@ -334,6 +338,8 @@ impl Server {
                     &result,
                     stats,
                     &render_opts(
+                        // rerun resets every cycle.
+                        true,
                         &input.strip_boot_noise,
                         input.strip_ansi,
                         stop_re.as_ref(),
@@ -474,6 +480,7 @@ fn decode_mode(defmt: &Option<DefmtTable>, framing: DefmtFraming) -> DecodeMode<
 
 #[allow(clippy::too_many_arguments)]
 fn render_opts<'a>(
+    captured_from_reset: bool,
     strip_boot_noise: &bool,
     strip_ansi: bool,
     stop_re: Option<&'a regex::Regex>,
@@ -483,6 +490,7 @@ fn render_opts<'a>(
     module: Option<&'a regex::Regex>,
 ) -> RenderOpts<'a> {
     RenderOpts {
+        captured_from_reset,
         strip_boot_noise: *strip_boot_noise,
         strip_ansi,
         stop_re,

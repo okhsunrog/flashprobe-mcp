@@ -12,6 +12,10 @@ use std::collections::BTreeMap;
 /// (`strip_*`) and defmt-mode fields (`min_level`, `module`) are each ignored by
 /// the other path.
 pub struct RenderOpts<'a> {
+    /// Whether this capture reset the target before reading, as `rerun` and
+    /// `flash_monitor` do. Changes what an empty capture means, and so what
+    /// advice is worth giving for one.
+    pub captured_from_reset: bool,
     pub strip_boot_noise: bool,
     pub strip_ansi: bool,
     pub stop_re: Option<&'a Regex>,
@@ -42,6 +46,42 @@ pub fn truncate_line(s: &str, max: usize) -> String {
 
 /// Render a capture, choosing the text or defmt path. `defmt` is `Some` (with
 /// decode stats) when the capture was decoded as defmt.
+/// What to show when a capture produced no lines.
+///
+/// "Nothing arrived" and "something arrived but was filtered out" look the same
+/// in the output and have completely different causes, so they are worded
+/// differently. The silent case is the one that misleads: a target that prints
+/// at boot and then idles produces nothing at all for a capture that did not
+/// reset it, which reads as a broken tool rather than a quiet target. A capture
+/// that did reset the target needs different advice, so the two are separated.
+fn empty_body(raw_bytes: usize, filtered: bool, captured_from_reset: bool) -> String {
+    if raw_bytes == 0 {
+        let hint = if captured_from_reset {
+            // The target was reset and still said nothing, so pointing at the
+            // reset-based tools would be circular. What is left is a target that
+            // does not run, or does not log where this backend is listening.
+            concat!(
+                "The target was reset and still sent nothing. Either it is not running (a ",
+                "reset that leaves an ESP in download mode does this), or it logs somewhere ",
+                "this backend is not listening \u{2014} firmware using RTT produces nothing on ",
+                "the serial backend, and vice versa."
+            )
+        } else {
+            concat!(
+                "The target sent no bytes while this capture was open. If it prints at boot ",
+                "and then goes quiet, use `rerun` or `flash_monitor`, which reset it and ",
+                "capture from the start; a plain `monitor` only sees what is sent after it ",
+                "attaches."
+            )
+        };
+        format!("(nothing was received)\n\n{hint}")
+    } else if filtered {
+        "(bytes arrived, but every line was removed by the filters)".to_string()
+    } else {
+        "(no application output\u{2014}only boot/ROM noise was captured)".to_string()
+    }
+}
+
 pub fn render_block(
     header_line: &str,
     result: &CaptureResult,
@@ -78,11 +118,14 @@ fn render_text(header_line: &str, result: &CaptureResult, opts: &RenderOpts) -> 
         header.push_str(&format!(" ({} shown after cleaning)", processed.len()));
     }
     if result.truncated {
-        header.push_str("\n[truncated: output cap reached, capture stopped early]");
+        header.push_str(
+            "\n[truncated: output cap reached, capture stopped early. Reads arrive in \
+             chunks, so the captured total overshoots the cap rather than landing on it]",
+        );
     }
 
     let body = if processed.is_empty() {
-        "(no application output\u{2014}only boot/ROM noise was captured)".to_string()
+        empty_body(result.raw_bytes, false, opts.captured_from_reset)
     } else {
         processed
     };
@@ -145,7 +188,10 @@ fn render_defmt(
         header.push_str(&format!(", {} malformed", stats.malformed));
     }
     if result.truncated {
-        header.push_str("\n[truncated: output cap reached, capture stopped early]");
+        header.push_str(
+            "\n[truncated: output cap reached, capture stopped early. Reads arrive in \
+             chunks, so the captured total overshoots the cap rather than landing on it]",
+        );
     }
     if !hidden_by_level.is_empty() {
         // Highest level first: "hidden by level: 412 debug, 30 trace".
@@ -164,7 +210,10 @@ fn render_defmt(
     }
 
     let body = if shown.is_empty() {
-        "(no frames matched the filters)".to_string()
+        // Anything decoded or hidden means bytes did arrive and the filters are
+        // what emptied the output.
+        let filtered = stats.decoded > 0 || !hidden_by_level.is_empty();
+        empty_body(result.raw_bytes, filtered, opts.captured_from_reset)
     } else {
         shown.join("\n")
     };
@@ -175,6 +224,33 @@ fn render_defmt(
 mod tests {
     use super::*;
     use crate::capture::StopReason;
+
+    #[test]
+    fn empty_body_tells_silence_apart_from_filtering() {
+        // Nothing arrived: the filters are not the reason, and the hint points
+        // at the case that actually causes this.
+        // Nothing arrived and nothing reset the target: suggest the tools that do.
+        let silent = empty_body(0, false, false);
+        assert!(silent.contains("nothing was received"), "{silent}");
+        assert!(silent.contains("rerun"), "{silent}");
+        assert!(!silent.contains("filters"), "{silent}");
+
+        // Nothing arrived even though the target was reset. Suggesting `rerun`
+        // here would be circular, since `rerun` is what produced this.
+        let after_reset = empty_body(0, false, true);
+        assert!(after_reset.contains("nothing was received"), "{after_reset}");
+        assert!(after_reset.contains("reset and still sent nothing"), "{after_reset}");
+        assert!(!after_reset.contains("use `rerun`"), "{after_reset}");
+
+        // Bytes arrived and the filters emptied the output.
+        let filtered = empty_body(500, true, false);
+        assert!(filtered.contains("filters"), "{filtered}");
+        assert!(!filtered.contains("nothing was received"), "{filtered}");
+
+        // Bytes arrived, nothing was filtered, but cleaning left nothing.
+        let noise = empty_body(500, false, false);
+        assert!(noise.contains("boot/ROM noise"), "{noise}");
+    }
 
     #[test]
     fn last_nonempty_and_truncate() {
@@ -210,6 +286,7 @@ mod tests {
         module: Option<&'a Regex>,
     ) -> RenderOpts<'a> {
         RenderOpts {
+            captured_from_reset: false,
             strip_boot_noise: true,
             strip_ansi: true,
             stop_re,
