@@ -87,6 +87,14 @@ So from a project directory, `flash_monitor { "backend": "probe-rs", "stop":
 "ready" }` flashes the built artifact to the detected chip and decodes defmt —
 nothing else to pass.
 
+Artifact detection uses the `target_directory` reported by `cargo metadata`.
+If a build wrapper overrides `CARGO_TARGET_DIR` only for the build, that directory
+may differ from what metadata reports when the MCP server runs. Pass the actual
+artifact path explicitly: `file_path` for `flash` / `flash_monitor`, or `elf` for
+`monitor` / `rerun`. For example, esp-hal's `hil-test` is built by xtask into the
+repository-root `target/`, although metadata from `hil-test/` reports its own
+`target/`. For that workflow, pass the ELF path and `chip` explicitly.
+
 Release is the usual thing to flash, but embedded projects routinely iterate on
 an optimized debug build — the `esp-generate` template sets `opt-level = "s"` for
 the dev profile precisely so it fits and runs. Picking whichever was built last
