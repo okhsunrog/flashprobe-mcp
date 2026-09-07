@@ -77,7 +77,7 @@ file, no state) and can be overridden per call:
 
 | Derived | From | Override |
 |---------|------|----------|
-| ELF / file to flash | `cargo metadata` build artifact | `file_path` / `elf`, `project_dir`, `bin` |
+| ELF / file to flash | `cargo metadata`, then the **more recently built** of `release/` and `debug/` | `file_path` / `elf`, `project_dir`, `bin` |
 | chip (probe-rs) | `.cargo/config.toml` runner `--chip` | `chip` |
 | serial port (espflash) | the sole USB serial port | `port` |
 | defmt vs text | the ELF's `.defmt` section | — (reliable) |
@@ -85,6 +85,13 @@ file, no state) and can be overridden per call:
 So from a project directory, `flash_monitor { "backend": "probe-rs", "stop":
 "ready" }` flashes the built artifact to the detected chip and decodes defmt —
 nothing else to pass.
+
+Release is the usual thing to flash, but embedded projects routinely iterate on
+an optimized debug build — the `esp-generate` template sets `opt-level = "s"` for
+the dev profile precisely so it fits and runs. Picking whichever was built last
+covers both, and fails safe: after a release build followed by an edit and a
+plain `cargo build`, the debug binary is the one you meant, where preferring
+release would have silently flashed the stale image.
 
 ## Tools
 
@@ -115,17 +122,57 @@ mechanism); only `list_ports` is serial-specific.
 - **`idle_ms`** — no new data for this long (default `4000`).
 - **`timeout_s`** — max wall-clock window (default `5`).
 - **`max_bytes`** — byte cap; stops early and marks the output truncated
-  (default `65536`).
+  (default `65536`). Reads arrive in chunks, so a capture stops just *past* the
+  cap: a reported byte count above `max_bytes` is expected, not a miscount.
 
 For probe-rs boot capture, the server temporarily makes the RTT up-channel
 blocking to preserve the earliest frames, then restores the firmware's original
 channel mode when capture ends.
+
+After a reset the server waits up to `rtt_attach_timeout_ms` (default `1500`)
+for the firmware to initialize RTT. An ESP32-C5 booting through the ESP-IDF
+bootloader was measured attaching in under 200 ms, so the default has ample
+headroom while still reporting a firmware that never brings RTT up. Raise it for
+a target whose bootloader runs materially longer.
 
 **Show filters:** `grep` (regex, both modes), `context` (N lines around the
 `stop` match), and defmt-only `level` (minimum to show) / `module` (regex on the
 module path). In defmt mode a suppressed-by-level count reports what a looser
 `level` would reveal. In text mode, ROM/bootloader boot noise (`strip_boot_noise`)
 and ANSI codes (`strip_ansi`) are stripped by default.
+
+## When a capture comes back empty
+
+An empty capture has three distinct causes, and the output names which one it
+was rather than leaving you to guess:
+
+- **`(nothing was received)`** — no bytes arrived at all. Loosening the filters
+  cannot help. What follows depends on whether the capture reset the target:
+  - After `monitor`, the usual cause is a target that prints at boot and then
+    idles. `monitor` only sees what is sent *after* it attaches; use `rerun` or
+    `flash_monitor`, which reset first and capture from the start.
+  - After `rerun` or `flash_monitor`, the target was reset and still said
+    nothing. Either it is not running, or it logs where this backend is not
+    listening — RTT firmware produces nothing on the serial backend, and vice
+    versa. Check `backend` first; it is the most common mistake.
+- **`(bytes arrived, but every line was removed by the filters)`** — the data is
+  there. Relax `level`, `module` or `grep`. In defmt mode the header also
+  reports how many frames a looser `level` would reveal.
+- **`(no application output — only boot/ROM noise was captured)`** — text mode
+  only: bytes arrived but `strip_boot_noise` removed all of them. Set it to
+  `false` to see the raw stream.
+
+A capture that ran *after* another capture already drained the buffer is not a
+failure either: `rerun` consumes the output it captures, so a `monitor` right
+afterwards has genuinely nothing left to show for firmware that prints once.
+
+## Known target quirks
+
+- **ESP32-C5 over USB-Serial-JTAG.** espflash's DTR/RTS reset leaves this board
+  in download mode rather than booting the application, so `rerun` and
+  `flash_monitor` on the `espflash` backend capture nothing from it — the
+  application never starts. Reset or flash through `probe-rs` to boot it
+  normally. The serial backend still reads fine; it is the reset that differs.
 
 ## Sending to the target
 
@@ -166,6 +213,12 @@ defmt decode needs the **exact ELF that's running** — version skew yields
 garbage, not an error. It's free in the flash-then-monitor flow (just built it);
 for bare `monitor`/`rerun`, make sure the auto-detected (or passed) ELF matches.
 The server surfaces a warning when a non-empty stream decodes to zero frames.
+
+On the serial backend, defmt frames are marker-delimited (`0xFF 0x00`) precisely
+so they can share the line with plain text, and both are shown. That matters
+because the ROM and the ESP-IDF bootloader print text long before the
+application's first frame: a target that dies in the bootloader still tells you
+why, instead of looking like a target that said nothing.
 
 ## License
 
