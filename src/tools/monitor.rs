@@ -10,6 +10,7 @@
 /// under 200 ms, so the default leaves roughly seven times that as headroom
 /// while still reporting a firmware that never initializes RTT quickly. The
 /// knob exists for a target whose bootloader takes materially longer.
+#[cfg(feature = "probe-rs")]
 fn rtt_attach_timeout(ms: Option<u64>) -> std::time::Duration {
     std::time::Duration::from_millis(ms.unwrap_or(1500))
 }
@@ -275,14 +276,18 @@ impl Server {
             // Parsed once; every cycle re-sends it after its own reset.
             let send = input.send.as_deref().map(parse_escapes).transpose()?;
 
-            // One reset + flush + capture on the selected backend / decode mode.
+            // One reset + capture on the selected backend / decode mode.
             let one_cycle = || -> Result<(CaptureResult, Option<DefmtStats>), String> {
                 let opts = CaptureOpts {
                     timeout: Duration::from_secs_f64(input.timeout_s),
                     idle: Duration::from_millis(input.idle_ms),
                     stop: stop_re.clone(),
                     stop_on_level,
-                    flush: true, // start each capture clean
+                    // RTT reset-and-attach already invalidates the old control
+                    // block. Flushing here would discard this boot's early
+                    // frames (or the entire log for short-lived output).
+                    // Keep the existing serial input cleanup behavior.
+                    flush: matches!(&conn, Conn::Serial(_)),
                     max_bytes: input.max_bytes,
                     send: send.clone(),
                 };

@@ -394,9 +394,7 @@ impl RttSource {
             };
             match attached {
                 Ok(rtt) => break rtt,
-                Err(_) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(5))
-                }
+                Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
                 Err(e) => {
                     return Err(format!(
                         "Failed to attach RTT within {:.1}s (is the firmware running and \
