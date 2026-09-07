@@ -1,5 +1,5 @@
 //! probe-rs backend: JTAG/SWD flashing via the flashing API and a [`ByteSource`]
-//! over an RTT up-channel. Text mode only for now (defmt decode arrives later).
+//! over RTT or semihosting, selected from the ELF or an explicit override.
 //!
 //! This entire module is gated behind the default-on `probe-rs` cargo feature;
 //! the dep tree is large, so an espflash-only build can drop it with
@@ -534,6 +534,121 @@ mod tests {
         assert!(
             probe_rs::flashing::image_format("idf").is_some(),
             "IDF image format missing — ESP flashing would fall back to raw ELF"
+        );
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureTransport {
+    Rtt,
+    Semihosting,
+}
+
+impl CaptureTransport {
+    pub fn select(value: Option<&str>, elf: Option<&str>) -> Result<Self, String> {
+        match value.unwrap_or("auto") {
+            "rtt" => Ok(Self::Rtt),
+            "semihosting" => Ok(Self::Semihosting),
+            "auto" => {
+                // Without an ELF retain the existing RTT RAM scan behavior.
+                let Some(path) = elf else {
+                    return Ok(Self::Rtt);
+                };
+                let data =
+                    std::fs::read(path).map_err(|e| format!("Cannot read ELF '{path}': {e}"))?;
+                let addr = probe_rs::rtt::find_rtt_control_block_in_raw_file(&data)
+                    .map_err(|e| format!("Cannot inspect ELF '{path}': {e}"))?;
+                Ok(if addr.is_some() {
+                    Self::Rtt
+                } else {
+                    Self::Semihosting
+                })
+            }
+            other => Err(format!(
+                "Unknown transport '{other}'; use auto, rtt, or semihosting"
+            )),
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Rtt => "RTT",
+            Self::Semihosting => "semihosting",
+        }
+    }
+    pub fn attach(
+        self,
+        session: Session,
+        elf: Option<&str>,
+        timeout: Duration,
+        reset: bool,
+    ) -> Result<Box<dyn ByteSource>, String> {
+        match self {
+            Self::Rtt if reset => Ok(Box::new(reset_and_attach_rtt(session, elf, timeout)?)),
+            Self::Rtt => Ok(Box::new(RttSource::attach(session, elf, timeout)?)),
+            Self::Semihosting => Ok(Box::new(super::semihosting::SemihostingSource::attach(
+                session, elf, reset,
+            )?)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+    use object::write::{Object, Symbol, SymbolSection};
+    use object::{
+        Architecture, BinaryFormat, Endianness, SectionKind, SymbolFlags, SymbolKind, SymbolScope,
+    };
+
+    #[test]
+    fn selection_uses_defined_rtt_symbol_and_respects_override() {
+        let mut elf = Object::new(BinaryFormat::Elf, Architecture::Riscv32, Endianness::Little);
+        let section = elf.add_section(vec![], b".bss".to_vec(), SectionKind::UninitializedData);
+        elf.append_section_bss(section, 64, 4);
+        let path =
+            std::env::temp_dir().join(format!("flashprobe-transport-{}.elf", std::process::id()));
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(path.clone());
+        let path = path.to_str().unwrap();
+        std::fs::write(path, elf.write().unwrap()).unwrap();
+        assert_eq!(
+            CaptureTransport::select(None, Some(path)).unwrap(),
+            CaptureTransport::Semihosting
+        );
+        assert_eq!(
+            CaptureTransport::select(Some("rtt"), Some(path)).unwrap(),
+            CaptureTransport::Rtt
+        );
+        elf.add_symbol(Symbol {
+            name: b"_SEGGER_RTT".to_vec(),
+            value: 0,
+            size: 64,
+            kind: SymbolKind::Data,
+            scope: SymbolScope::Linkage,
+            weak: false,
+            section: SymbolSection::Section(section),
+            flags: SymbolFlags::None,
+        });
+        std::fs::write(path, elf.write().unwrap()).unwrap();
+        assert_eq!(
+            CaptureTransport::select(Some("auto"), Some(path)).unwrap(),
+            CaptureTransport::Rtt
+        );
+        assert_eq!(
+            CaptureTransport::select(Some("semihosting"), Some(path)).unwrap(),
+            CaptureTransport::Semihosting
+        );
+        std::fs::write(path, b"invalid ELF").unwrap();
+        assert!(CaptureTransport::select(None, Some(path)).is_err());
+        assert!(CaptureTransport::select(Some("typo"), None).is_err());
+        assert_eq!(
+            CaptureTransport::select(None, None).unwrap(),
+            CaptureTransport::Rtt
         );
     }
 }

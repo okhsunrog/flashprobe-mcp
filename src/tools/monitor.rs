@@ -41,7 +41,7 @@ use crate::backend::probers;
 #[tool_router(router = capture_router, vis = "pub(crate)")]
 impl Server {
     #[tool(
-        description = "Read output from a device for a bounded window. Backend (REQUIRED): \"probe-rs\" (RTT) or \"espflash\" (UART). The ELF auto-detects from the project for defmt decode (structured level/module; or pass `elf`); else plain text. Stops on: regex `stop`, `stop_on_level` (defmt), idle_ms, max timeout, or byte cap. Text mode strips boot noise + ANSI and focuses on the `stop` match. To drive a firmware command interface, set `send` (e.g. \"status\\n\"): it is written to the target after the flush and before reading, so the reply lands in this capture - pair it with `stop` to return the moment the answer arrives."
+        description = "Read output from a device for a bounded window. An embedded-test ELF runs a fresh suite (resets before each test); ordinary firmware attaches without reset. Backend (REQUIRED): \"probe-rs\" (RTT/semihosting) or \"espflash\" (UART). The ELF auto-detects from the project for defmt decode (structured level/module; or pass `elf`); else plain text. Stops on: regex `stop`, `stop_on_level` (defmt), idle_ms, max timeout, or byte cap. Text mode strips boot noise + ANSI and focuses on the `stop` match. To drive a firmware command interface, set `send` (e.g. \"status\\n\"): it is written to the target after the flush and before reading, so the reply lands in this capture - pair it with `stop` to return the moment the answer arrives."
     )]
     async fn monitor(
         &self,
@@ -82,19 +82,28 @@ impl Server {
                     #[cfg(feature = "probe-rs")]
                     BackendKind::ProbeRs => {
                         let chip = det.chip(input.chip.as_deref())?;
+                        let transport = probers::CaptureTransport::select(
+                            input.transport.as_deref(),
+                            elf.as_deref(),
+                        )?;
                         let session = probers::open_session(&chip, input.probe.as_deref())?;
                         (
-                            Box::new(probers::RttSource::attach(
+                            transport.attach(
                                 session,
                                 elf.as_deref(),
                                 rtt_attach_timeout(input.rtt_attach_timeout_ms),
-                            )?),
-                            format!("Probe: {chip} via RTT"),
+                                false,
+                            )?,
+                            format!("Probe: {chip} via {}", transport.label()),
                             DefmtFraming::Raw,
                         )
                     }
                 };
-            let defmt = load_optional_table(elf.as_deref())?;
+            let defmt = if source.text_only() {
+                None
+            } else {
+                load_optional_table(elf.as_deref())?
+            };
             let mode = decode_mode(&defmt, framing);
             send_delay(opts.send.as_ref(), input.send_delay_ms);
             let (result, stats) = capture(source.as_mut(), &mode, &opts)?;
@@ -126,7 +135,7 @@ impl Server {
     }
 
     #[tool(
-        description = "Flash firmware, then immediately capture output to verify the boot. Backend (REQUIRED): \"probe-rs\" (flash + RTT) or \"espflash\" (flash + UART). File/chip auto-detect from the project; the flashed ELF is the defmt source. Captures from boot. Stops on: regex `stop`, `stop_on_level` (defmt), idle_ms, max timeout, or byte cap. `send` writes a command to the target before reading; on a just-flashed device pair it with `send_delay_ms` so the firmware is up first."
+        description = "Flash firmware, then immediately capture output to verify the boot. Backend (REQUIRED): \"probe-rs\" (flash + RTT/semihosting) or \"espflash\" (flash + UART). File/chip auto-detect from the project; the flashed ELF is the defmt source. Captures from boot. Stops on: regex `stop`, `stop_on_level` (defmt), idle_ms, max timeout, or byte cap. `send` writes a command to the target before reading; on a just-flashed device pair it with `send_delay_ms` so the firmware is up first."
     )]
     async fn flash_monitor(
         &self,
@@ -183,18 +192,23 @@ impl Server {
                 #[cfg(feature = "probe-rs")]
                 BackendKind::ProbeRs => {
                     let chip = det.chip(input.chip.as_deref())?;
+                    let transport = probers::CaptureTransport::select(
+                        input.transport.as_deref(),
+                        Some(&file_path),
+                    )?;
                     let mut session = probers::open_session(&chip, input.probe.as_deref())?;
                     let msg = probers::download(&mut session, &file_path, &chip)?;
-                    // Reset + attach RTT so capture starts at the run's beginning.
-                    let src = probers::reset_and_attach_rtt(
+                    // Reset + attach the selected transport so capture starts at the run's beginning.
+                    let src = transport.attach(
                         session,
                         Some(&file_path),
                         rtt_attach_timeout(input.rtt_attach_timeout_ms),
+                        true,
                     )?;
                     (
                         msg,
-                        Box::new(src),
-                        format!("Probe: {chip} via RTT"),
+                        src,
+                        format!("Probe: {chip} via {}", transport.label()),
                         DefmtFraming::Raw,
                     )
                 }
@@ -205,7 +219,11 @@ impl Server {
                 .elf
                 .clone()
                 .or_else(|| (input.flash_address.is_none()).then(|| file_path.clone()));
-            let defmt = load_optional_table(elf_path.as_deref())?;
+            let defmt = if source.text_only() {
+                None
+            } else {
+                load_optional_table(elf_path.as_deref())?
+            };
             let mode = decode_mode(&defmt, framing);
             send_delay(opts.send.as_ref(), input.send_delay_ms);
             let (result, stats) = capture(source.as_mut(), &mode, &opts)?;
@@ -239,7 +257,7 @@ impl Server {
     }
 
     #[tool(
-        description = "Re-run the firmware already on the device: reset (DTR/RTS for espflash, core reset for probe-rs), then capture the fresh boot. Backend (REQUIRED): \"probe-rs\" (RTT) or \"espflash\" (UART). ELF/chip auto-detect from the project for defmt decode. One call instead of reset + monitor. Set repeat > 1 to run N cycles back-to-back for a compact per-run summary - useful for characterizing flaky/intermittent bugs. `send` writes a command to the target after each reset (re-sent every cycle), so repeat > 1 also characterizes a flaky command response."
+        description = "Re-run the firmware already on the device: reset (DTR/RTS for espflash, core reset for probe-rs), then capture the fresh boot. Backend (REQUIRED): \"probe-rs\" (RTT/semihosting) or \"espflash\" (UART). ELF/chip auto-detect from the project for defmt decode. One call instead of reset + monitor. Set repeat > 1 to run N cycles back-to-back for a compact per-run summary - useful for characterizing flaky/intermittent bugs. `send` writes a command to the target after each reset (re-sent every cycle), so repeat > 1 also characterizes a flaky command response."
     )]
     async fn rerun(
         &self,
@@ -258,9 +276,10 @@ impl Server {
             enum Conn {
                 Serial(String),
                 #[cfg(feature = "probe-rs")]
-                Jtag(String),
+                Jtag(String, probers::CaptureTransport),
             }
 
+            let elf = det.elf_opt(input.elf.as_deref());
             let (header, framing, conn) = match parse_backend(input.backend.as_deref())? {
                 BackendKind::Espflash => {
                     let port = detect_serial_port(input.port.as_deref())?;
@@ -270,13 +289,20 @@ impl Server {
                 #[cfg(feature = "probe-rs")]
                 BackendKind::ProbeRs => {
                     let chip = det.chip(input.chip.as_deref())?;
-                    let header = format!("Probe: {chip} via RTT");
-                    (header, DefmtFraming::Raw, Conn::Jtag(chip))
+                    let transport = probers::CaptureTransport::select(
+                        input.transport.as_deref(),
+                        elf.as_deref(),
+                    )?;
+                    let header = format!("Probe: {chip} via {}", transport.label());
+                    (header, DefmtFraming::Raw, Conn::Jtag(chip, transport))
                 }
             };
 
-            let elf = det.elf_opt(input.elf.as_deref());
-            let defmt = load_optional_table(elf.as_deref())?;
+            let defmt = match &conn {
+                #[cfg(feature = "probe-rs")]
+                Conn::Jtag(_, probers::CaptureTransport::Semihosting) => None,
+                _ => load_optional_table(elf.as_deref())?,
+            };
             // Parsed once; every cycle re-sends it after its own reset.
             let send = input.send.as_deref().map(parse_escapes).transpose()?;
 
@@ -315,14 +341,15 @@ impl Server {
                         Box::new(SerialSource::open(port, input.baud)?)
                     }
                     #[cfg(feature = "probe-rs")]
-                    Conn::Jtag(chip) => {
+                    Conn::Jtag(chip, transport) => {
                         let session = probers::open_session(chip, input.probe.as_deref())?;
-                        // Reset + attach RTT so each cycle captures from the start.
-                        Box::new(probers::reset_and_attach_rtt(
+                        // Reset + attach the selected transport so each cycle captures from the start.
+                        transport.attach(
                             session,
                             elf.as_deref(),
                             rtt_attach_timeout(input.rtt_attach_timeout_ms),
-                        )?)
+                            true,
+                        )?
                     }
                 };
                 send_delay(opts.send.as_ref(), input.send_delay_ms);

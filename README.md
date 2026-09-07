@@ -4,7 +4,7 @@ An [MCP](https://modelcontextprotocol.io) server for flashing and monitoring
 embedded targets from any MCP client (Claude Code, Claude Desktop, …). It covers
 the whole bench from one tool surface, over two backends:
 
-- **probe-rs** — JTAG/SWD flashing + **RTT** capture. Any
+- **probe-rs** — JTAG/SWD flashing + **RTT or semihosting** capture. Any
   [probe-rs-supported](https://probe.rs/targets/) chip: ESP (Xtensa + RISC-V),
   STM32, nRF, RP2040/RP2350, …
 - **espflash** — UART flashing + serial capture for ESP32-family chips.
@@ -63,10 +63,11 @@ the [probe-rs udev rules](https://probe.rs/docs/getting-started/probe-setup/).
 
 Every flash/monitor call takes an explicit **`backend`**: `"probe-rs"` or
 `"espflash"`. Both work on ESP chips, and the right one depends on **where the
-firmware emits output** — RTT (probe-rs) vs UART (espflash). Picking the wrong
+firmware emits output** — RTT/semihosting (probe-rs) vs UART (espflash). Picking the wrong
 one flashes fine but shows no logs, so the server asks rather than guessing.
 
 - defmt-rtt / rtt-target firmware → `probe-rs`
+- semihosting / embedded-test firmware → `probe-rs`
 - esp-println / UART firmware → `espflash`
 - any non-ESP chip → `probe-rs`
 
@@ -103,7 +104,7 @@ mechanism); only `list_ports` is serial-specific.
 | `flash` | Flash an ELF/binary (no monitor) | espflash: IDF format / raw `flash_address`; probe-rs: flash-algo |
 | `flash_monitor` | Flash, then capture from boot | |
 | `rerun` | Reset (no reflash) + capture; `repeat > 1` for flaky-bug runs | |
-| `monitor` | Attach + capture only | |
+| `monitor` | Attach + capture; embedded-test ELF starts a fresh test suite | |
 | `reset_device` | Reset the device | espflash: DTR/RTS; probe-rs: core reset |
 | `erase_flash` / `erase_region` | Erase flash (destructive) | espflash: ROM erase (4 KiB-aligned region); probe-rs: flash-algo (sector-covering) |
 | `read_flash` | Read a memory/flash region to a file | espflash: ROM read; probe-rs: debug-port memory read |
@@ -125,7 +126,48 @@ mechanism); only `list_ports` is serial-specific.
   (default `65536`). Reads arrive in chunks, so a capture stops just *past* the
   cap: a reported byte count above `max_bytes` is expected, not a miscount.
 
-For probe-rs boot capture, the server temporarily makes the RTT up-channel
+For probe-rs captures, `transport` accepts `"auto"` (default), `"rtt"`, or
+`"semihosting"`. Auto uses RTT when the ELF defines `_SEGGER_RTT`, otherwise
+semihosting. Without an ELF, auto retains RTT RAM scanning; pass an ELF or
+force semihosting for a console-only application. The output header reports
+`via RTT` or `via semihosting`. An unreadable/invalid ELF is an error, not an
+auto-detection fallback. `rtt_attach_timeout_ms` applies only to RTT.
+
+Semihosting uses probe-rs library requests for console writes, stdout/stderr,
+command line, time, errno and exit. Console data uses text decoding even if the
+ELF contains a defmt table. `stop`, `grep`, `context`, idle/timeout/byte limits,
+ANSI/noise filtering and empty/truncated reporting share the normal capture
+pipeline. `stop_on_level`, `level` and `module` need defmt metadata and do not
+apply to this text stream. Target exit ends capture without waiting for idle.
+File access and stdin/`send` are unsupported. A semihosting flush is a no-op:
+servicing a pending syscall would execute firmware and consume fresh output.
+
+An ELF with embedded-test protocol 1 metadata (embedded-test >= 0.7) runs as a
+test suite: the host supplies each test address, resets between tests, honours
+ignored tests, expected panics and per-test timeouts, and emits `test NAME ...
+ok/FAILED` plus `test result: ...`. Earlier/future protocol versions produce an
+explicit error. For embedded-test only, `monitor` also starts a fresh suite,
+resetting before the first test as well as between tests. A detached ESP may already have treated
+the semihosting trap as an exception, so attach-only cannot reliably recover its
+test command. Ordinary semihosting applications still attach without reset.
+`rerun` resets and runs the entire suite per repeat. A failed test remains
+visible in the text; matching `test result:` means completion, not test success.
+Set a capture window long enough for the entire suite, for example:
+
+```json
+{"backend":"probe-rs","chip":"esp32c5","elf":"/path/to/misc_drivers",
+ "stop":"test result:","timeout_s":200,"idle_ms":65000,"repeat":3}
+```
+
+Use this with `rerun`; for `flash_monitor` use `file_path` instead of `elf` and
+omit `repeat`. Semihosting polling services core 0; multicore console capture is
+not implemented. Stopping a capture stops host servicing, so firmware can block
+at its next semihosting request until another monitor attaches.
+
+Hardware evidence and reproducible MCP stdio commands are in
+[docs/semihosting.md](docs/semihosting.md).
+
+For probe-rs RTT boot capture, the server temporarily makes the RTT up-channel
 blocking to preserve the earliest frames, then restores the firmware's original
 channel mode when capture ends.
 

@@ -37,12 +37,12 @@ impl ServerHandler for Server {
             ))
             .with_instructions(
                 "Flash + monitor embedded targets over two backends — probe-rs \
-                 (JTAG/SWD + RTT; any probe-rs target: STM32, nRF, RP2350, ESP \
+                 (JTAG/SWD + RTT/semihosting; any probe-rs target: STM32, nRF, RP2350, ESP \
                  Xtensa+RISC-V, …) and espflash (UART; ESP only).\n\n\
                  ## Backend (required)\n\
                  Every flash/monitor call needs `backend`:\n\
-                 - \"probe-rs\": JTAG/SWD flashing + RTT capture. Use for firmware that \
-                   logs over RTT (defmt-rtt / rtt-target), and for all non-ESP chips.\n\
+                 - \"probe-rs\": JTAG/SWD flashing + RTT/semihosting capture. Use for firmware that \
+                   logs over RTT (defmt-rtt / rtt-target) or semihosting (embedded-test), and for all non-ESP chips.\n\
                  - \"espflash\": UART flashing + serial capture. Use for firmware that \
                    logs over UART (esp-println). ESP only.\n\
                  Both work on ESP chips; pick the one matching where the firmware emits \

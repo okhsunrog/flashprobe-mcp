@@ -200,7 +200,7 @@ pub struct ChecksumMd5Input {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct MonitorInput {
-    /// Backend (REQUIRED): "probe-rs" (RTT over JTAG/SWD) or "espflash" (UART).
+    /// Backend (REQUIRED): "probe-rs" (RTT/semihosting over JTAG/SWD) or "espflash" (UART).
     pub backend: Option<String>,
     /// Serial port path (espflash). Auto-detected if exactly one USB port.
     pub port: Option<String>,
@@ -281,6 +281,9 @@ pub struct MonitorInput {
     /// milliseconds (default: 1500). Raise it for a target whose bootloader runs
     /// for a while before the application starts.
     pub rtt_attach_timeout_ms: Option<u64>,
+    /// probe-rs capture transport: auto (default), rtt, or semihosting.
+    #[serde(default)]
+    pub transport: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -362,6 +365,9 @@ pub struct FlashMonitorInput {
     /// milliseconds (default: 1500). Raise it for a target whose bootloader runs
     /// for a while before the application starts.
     pub rtt_attach_timeout_ms: Option<u64>,
+    /// probe-rs capture transport: auto (default), rtt, or semihosting.
+    #[serde(default)]
+    pub transport: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -435,4 +441,7 @@ pub struct RerunInput {
     /// milliseconds (default: 1500). Raise it for a target whose bootloader runs
     /// for a while before the application starts.
     pub rtt_attach_timeout_ms: Option<u64>,
+    /// probe-rs capture transport: auto (default), rtt, or semihosting.
+    #[serde(default)]
+    pub transport: Option<String>,
 }

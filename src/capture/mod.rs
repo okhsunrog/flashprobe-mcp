@@ -37,6 +37,8 @@ pub fn capture(
     mode: &DecodeMode,
     opts: &CaptureOpts,
 ) -> Result<(CaptureResult, Option<DefmtStats>), String> {
+    let text_mode = DecodeMode::Text;
+    let mode = if source.text_only() { &text_mode } else { mode };
     match mode {
         DecodeMode::Text => {
             let mut decoder = TextDecoder::new();
@@ -66,6 +68,7 @@ pub enum StopReason {
     Idle,
     Cap,
     ReadError,
+    Finished,
 }
 
 impl StopReason {
@@ -75,7 +78,8 @@ impl StopReason {
             StopReason::Timeout => "timeout reached",
             StopReason::Idle => "idle timeout (no new data)",
             StopReason::Cap => "output cap reached",
-            StopReason::ReadError => "serial read error",
+            StopReason::ReadError => "source read error",
+            StopReason::Finished => "source completed",
         }
     }
 }
@@ -185,6 +189,9 @@ pub fn run_capture(
 
         match source.read(&mut buf) {
             Ok(0) => {
+                if source.finished() {
+                    break (StopReason::Finished, matched, false);
+                }
                 let nap = source.idle_nap();
                 if !nap.is_zero() {
                     std::thread::sleep(nap);
@@ -231,14 +238,22 @@ pub fn run_capture(
             Err(e) => {
                 let empty = lines.is_empty() && decoder.pending().is_none_or(|p| p.is_empty());
                 if empty {
-                    return Err(format!("Serial read error: {e}"));
+                    return Err(format!("Source read error: {e}"));
                 }
+                if let Some(tail) = decoder.pending().filter(|p| !p.is_empty()) {
+                    lines.push(Line::text(tail));
+                }
+                lines.push(Line::text(format!("Source read error: {e}")));
                 break (StopReason::ReadError, matched, false);
             }
         }
     };
 
-    let pending = decoder.pending().unwrap_or("").to_string();
+    let pending = if outcome.0 == StopReason::ReadError {
+        String::new() // The unterminated tail was emitted before the diagnostic.
+    } else {
+        decoder.pending().unwrap_or("").to_string()
+    };
     Ok(CaptureResult {
         lines,
         pending,
@@ -349,5 +364,65 @@ mod tests {
             panic!("capture should fail when the payload cannot be delivered");
         };
         assert!(err.contains("does not support sending"), "got: {err}");
+    }
+}
+
+#[cfg(test)]
+mod finite_source_tests {
+    use super::*;
+    struct Finite {
+        chunks: std::collections::VecDeque<Vec<u8>>,
+    }
+    impl ByteSource for Finite {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let Some(bytes) = self.chunks.pop_front() else {
+                return Ok(0);
+            };
+            buf[..bytes.len()].copy_from_slice(&bytes);
+            Ok(bytes.len())
+        }
+        fn finished(&self) -> bool {
+            self.chunks.is_empty()
+        }
+    }
+    fn run(chunks: &[&[u8]], stop: Option<&str>, cap: usize) -> CaptureResult {
+        let mut source = Finite {
+            chunks: chunks.iter().map(|s| s.to_vec()).collect(),
+        };
+        let opts = CaptureOpts {
+            timeout: Duration::from_secs(1),
+            idle: Duration::from_secs(1),
+            stop: stop.map(|s| Regex::new(s).unwrap()),
+            stop_on_level: None,
+            flush: false,
+            max_bytes: cap,
+            send: None,
+        };
+        run_capture(&mut source, &mut TextDecoder::new(), &opts).unwrap()
+    }
+    #[test]
+    fn completion_preserves_unterminated_output() {
+        let r = run(&[b"first\n", b"last"], None, 4096);
+        assert_eq!(r.stop_reason, StopReason::Finished);
+        assert_eq!(raw_text(&r), "first\nlast");
+        assert_eq!(r.raw_bytes, 10);
+    }
+    #[test]
+    fn split_summary_matches_before_completion() {
+        let r = run(
+            &[b"test a ... ok\ntest res", b"ult: ok. 1 passed; 0 failed\n"],
+            Some("test result:"),
+            4096,
+        );
+        assert_eq!(r.stop_reason, StopReason::Matched);
+        assert!(r.matched);
+        assert!(raw_text(&r).contains("1 passed; 0 failed"));
+    }
+    #[test]
+    fn finite_source_still_obeys_cap() {
+        let r = run(&[b"1234", b"5678"], None, 4);
+        assert_eq!(r.stop_reason, StopReason::Cap);
+        assert!(r.truncated);
+        assert_eq!(r.raw_bytes, 4);
     }
 }

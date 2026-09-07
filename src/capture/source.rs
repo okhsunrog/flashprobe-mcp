@@ -6,6 +6,16 @@
 use std::time::Duration;
 
 pub trait ByteSource {
+    /// True once a finite source has completed and all buffered bytes were read.
+    fn finished(&self) -> bool {
+        false
+    }
+
+    /// Semihosting console output is text even if the ELF also contains defmt.
+    fn text_only(&self) -> bool {
+        false
+    }
+
     /// Read whatever bytes are available right now into `buf`. Returns `Ok(0)`
     /// when nothing is ready yet (the loop treats 0 as "no data this tick", not
     /// EOF, and paces itself with [`ByteSource::idle_nap`]). `Err` only on a real
