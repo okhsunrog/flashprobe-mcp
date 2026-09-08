@@ -8,7 +8,8 @@
 use crate::capture::ByteSource;
 use probe_rs::config::MemoryRegion;
 use probe_rs::flashing::{
-    ElfLoader, ElfOptions, FlashProgress, ImageLoader, download_file, erase, erase_all,
+    ElfLoader, ElfOptions, FlashError, FlashProgress, ImageLoader, build_loader, download_file,
+    erase, erase_all,
 };
 use probe_rs::probe::DebugProbeInfo;
 use probe_rs::probe::list::Lister;
@@ -134,6 +135,28 @@ pub fn download(session: &mut Session, path: &str, chip: &str) -> Result<String,
     download_file(session, path, format_for_chip(chip))
         .map_err(|e| format!("probe-rs flash failed: {e}"))?;
     Ok(format!("Flashed {path} to {chip} via probe-rs (JTAG/SWD)"))
+}
+
+/// Whether the flash holds exactly the image `path` would be flashed as.
+///
+/// Reads back every range the image covers and compares, the way
+/// `probe-rs run --preverify` decides whether it can skip flashing. Nothing
+/// is written. `Ok(false)` is a plain mismatch; `Err` is a probe or image
+/// problem.
+///
+/// This matters for embedded-test firmware in particular: the host runner
+/// tells the target which test to run by *address*, taken from the ELF on
+/// disk. If the flash holds an older build, those addresses land in the wrong
+/// functions and the run fails with random exceptions that look like firmware
+/// bugs. A capture that does not flash first has to check.
+pub fn verify_flash(session: &mut Session, path: &str, chip: &str) -> Result<bool, String> {
+    let loader = build_loader(session, path, format_for_chip(chip), None)
+        .map_err(|e| format!("Cannot load '{path}' for verification: {e}"))?;
+    match loader.verify(session, &mut FlashProgress::empty()) {
+        Ok(()) => Ok(true),
+        Err(FlashError::Verify) => Ok(false),
+        Err(e) => Err(format!("probe-rs flash verification failed: {e}")),
+    }
 }
 
 /// Download then reset-and-run so the firmware executes (no monitoring).
@@ -575,18 +598,25 @@ impl CaptureTransport {
             Self::Semihosting => "semihosting",
         }
     }
+    /// `verify_flash` asks a semihosting embedded-test capture to check that
+    /// the flash matches `elf` before running anything; pass `false` right
+    /// after flashing that same file, when the check could only pass.
     pub fn attach(
         self,
         session: Session,
         elf: Option<&str>,
         timeout: Duration,
         reset: bool,
+        verify_flash: bool,
     ) -> Result<Box<dyn ByteSource>, String> {
         match self {
             Self::Rtt if reset => Ok(Box::new(reset_and_attach_rtt(session, elf, timeout)?)),
             Self::Rtt => Ok(Box::new(RttSource::attach(session, elf, timeout)?)),
             Self::Semihosting => Ok(Box::new(super::semihosting::SemihostingSource::attach(
-                session, elf, reset,
+                session,
+                elf,
+                reset,
+                verify_flash,
             )?)),
         }
     }

@@ -140,7 +140,12 @@ pub struct SemihostingSource {
 }
 
 impl SemihostingSource {
-    pub fn attach(mut session: Session, elf: Option<&str>, reset: bool) -> Result<Self, String> {
+    pub fn attach(
+        mut session: Session,
+        elf: Option<&str>,
+        reset: bool,
+        verify_flash: bool,
+    ) -> Result<Self, String> {
         let tests = elf
             .map(|path| {
                 std::fs::read(path)
@@ -150,6 +155,22 @@ impl SemihostingSource {
             .transpose()
             .map_err(|e| format!("Semihosting ELF: {e:#}"))?
             .flatten();
+        // The runner drives the target by addresses read from this ELF, so the
+        // flash has to hold this very build. A stale image runs the wrong code
+        // at those addresses and dies with exceptions that look like firmware
+        // bugs; refuse up front with the actual cause instead.
+        if verify_flash && tests.is_some() {
+            let path = elf.expect("tests come from an ELF path");
+            let chip = session.target().name.clone();
+            if !super::probers::verify_flash(&mut session, path, &chip)? {
+                return Err(format!(
+                    "The flash does not hold the image built from '{path}': the firmware on the \
+                     device is a different build. embedded-test selects tests by address from \
+                     this ELF, so running it against another build jumps into the wrong code. \
+                     Flash it first: `flash_monitor` with this file, or `flash` and then this call."
+                ));
+            }
+        }
         if reset || tests.is_some() {
             let mut core = session.core(0).map_err(|e| e.to_string())?;
             core.reset_and_halt(Duration::from_millis(500))

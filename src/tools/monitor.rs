@@ -41,7 +41,7 @@ use crate::backend::probers;
 #[tool_router(router = capture_router, vis = "pub(crate)")]
 impl Server {
     #[tool(
-        description = "Read output from a device for a bounded window. An embedded-test ELF runs a fresh suite (resets before each test); ordinary firmware attaches without reset. Backend (REQUIRED): \"probe-rs\" (RTT/semihosting) or \"espflash\" (UART). The ELF auto-detects from the project for defmt decode (structured level/module; or pass `elf`); else plain text. Stops on: regex `stop`, `stop_on_level` (defmt), idle_ms, max timeout, or byte cap. Text mode strips boot noise + ANSI and focuses on the `stop` match. To drive a firmware command interface, set `send` (e.g. \"status\\n\"): it is written to the target after the flush and before reading, so the reply lands in this capture - pair it with `stop` to return the moment the answer arrives."
+        description = "Read output from a device for a bounded window. An embedded-test ELF runs a fresh suite (resets before each test) after verifying that the flash holds that exact build - a rebuilt ELF that was not flashed is an error, use flash_monitor; ordinary firmware attaches without reset. Backend (REQUIRED): \"probe-rs\" (RTT/semihosting) or \"espflash\" (UART). The ELF auto-detects from the project for defmt decode (structured level/module; or pass `elf`); else plain text. Stops on: regex `stop`, `stop_on_level` (defmt), idle_ms, max timeout, or byte cap. Text mode strips boot noise + ANSI and focuses on the `stop` match. To drive a firmware command interface, set `send` (e.g. \"status\\n\"): it is written to the target after the flush and before reading, so the reply lands in this capture - pair it with `stop` to return the moment the answer arrives."
     )]
     async fn monitor(
         &self,
@@ -93,6 +93,7 @@ impl Server {
                                 elf.as_deref(),
                                 rtt_attach_timeout(input.rtt_attach_timeout_ms),
                                 false,
+                                true,
                             )?,
                             format!("Probe: {chip} via {}", transport.label()),
                             DefmtFraming::Raw,
@@ -204,6 +205,7 @@ impl Server {
                         Some(&file_path),
                         rtt_attach_timeout(input.rtt_attach_timeout_ms),
                         true,
+                        false,
                     )?;
                     (
                         msg,
@@ -257,7 +259,7 @@ impl Server {
     }
 
     #[tool(
-        description = "Re-run the firmware already on the device: reset (DTR/RTS for espflash, core reset for probe-rs), then capture the fresh boot. Backend (REQUIRED): \"probe-rs\" (RTT/semihosting) or \"espflash\" (UART). ELF/chip auto-detect from the project for defmt decode. One call instead of reset + monitor. Set repeat > 1 to run N cycles back-to-back for a compact per-run summary - useful for characterizing flaky/intermittent bugs. `send` writes a command to the target after each reset (re-sent every cycle), so repeat > 1 also characterizes a flaky command response."
+        description = "Re-run the firmware already on the device: reset (DTR/RTS for espflash, core reset for probe-rs), then capture the fresh boot. Backend (REQUIRED): \"probe-rs\" (RTT/semihosting) or \"espflash\" (UART). ELF/chip auto-detect from the project for defmt decode. Does not flash: for an embedded-test ELF the flash is verified against the file first, and a rebuilt ELF that was not flashed is an error (use flash_monitor). One call instead of reset + monitor. Set repeat > 1 to run N cycles back-to-back for a compact per-run summary - useful for characterizing flaky/intermittent bugs. `send` writes a command to the target after each reset (re-sent every cycle), so repeat > 1 also characterizes a flaky command response."
     )]
     async fn rerun(
         &self,
@@ -348,6 +350,7 @@ impl Server {
                             session,
                             elf.as_deref(),
                             rtt_attach_timeout(input.rtt_attach_timeout_ms),
+                            true,
                             true,
                         )?
                     }

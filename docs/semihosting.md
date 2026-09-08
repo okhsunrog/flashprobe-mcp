@@ -91,3 +91,33 @@ For another regression check, flash it with `flash_monitor`, then use `rerun` wi
 `reset_device` followed by `monitor` with `flush: false`; use `stop: "=== done ==="`
 and check for `RESULT PASS 19/19` and `ASYNC PASS 27/27`. Restore the semihosting
 ELF with `flash_monitor` after checking RTT.
+
+## Flash verification before a test run
+
+`rerun` and `monitor` do not flash. For an embedded-test ELF they now verify
+the flash against the file before the first reset, with the same read-back
+comparison `probe-rs run --preverify` uses, and refuse to run on a mismatch.
+`flash_monitor` skips the check because it has just written that image.
+
+The runner selects each test by address (`run_addr ADDRESS`) taken from the
+ELF on disk. When the flash holds an older build, those addresses land in the
+wrong functions and the run fails with random exceptions that look like
+firmware bugs. Reproduced on ESP32-C5 on 2026-09-08 by rebuilding
+`hil-test/src/bin/canfd.rs` with one extra test and calling `rerun` without
+flashing: `Load access fault` and `Illegal instruction` traps, tests reported
+under the wrong names, and one trap inside ROM at `0x40038504`. The same ELF
+after `probe-rs run --preverify` passed 40/40. The earlier "MCP rerun gives
+load access faults" observation on this driver had the same cause: a rebuild
+followed by `rerun` instead of `flash_monitor`.
+
+Verified on the same board on 2026-09-09 with a fresh release binary over
+`mcp_probe.py`, ELF `hil-test` `canfd` from esp-hal `4032a055f`:
+
+| Check | Observed result |
+| --- | --- |
+| `rerun`, flash matches the ELF | Verification passed, 40/40, 14.6 s including server start |
+| `rerun`, ELF rebuilt with one extra test, flash not updated | Refused in 1.1 s with the mismatch error; nothing ran on the target |
+| `flash_monitor` with that rebuilt ELF | Flashed and ran 41/41 in 14.8 s |
+
+The committed firmware was restored with `probe-rs run --preverify` afterwards
+(40/40).
