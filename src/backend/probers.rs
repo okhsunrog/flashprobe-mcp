@@ -88,20 +88,28 @@ pub fn open_session(chip: &str, probe_sel: Option<&str>) -> Result<Session, Stri
 
 /// `true` if the probe matches a `VID:PID` or `VID:PID:SERIAL` selector (hex).
 fn probe_matches(p: &DebugProbeInfo, sel: &str) -> bool {
-    let parts: Vec<&str> = sel.split(':').collect();
-    if parts.len() < 2 {
+    selector_matches(sel, p.vendor_id, p.product_id, p.serial_number.as_deref())
+}
+
+/// Everything after the second colon is the serial, verbatim: ESP USB-JTAG
+/// serials are MAC addresses (`1C:DB:D4:48:ED:98`), so splitting on every colon
+/// would keep only their first byte. Serials compare case-insensitively since
+/// they are usually hex and tools disagree on the case they print.
+fn selector_matches(sel: &str, vendor_id: u16, product_id: u16, serial: Option<&str>) -> bool {
+    let mut parts = sel.splitn(3, ':');
+    let (Some(vid), Some(pid)) = (parts.next(), parts.next()) else {
         return false;
-    }
-    let vid = u16::from_str_radix(parts[0].trim_start_matches("0x"), 16);
-    let pid = u16::from_str_radix(parts[1].trim_start_matches("0x"), 16);
+    };
+    let vid = u16::from_str_radix(vid.trim_start_matches("0x"), 16);
+    let pid = u16::from_str_radix(pid.trim_start_matches("0x"), 16);
     let (Ok(vid), Ok(pid)) = (vid, pid) else {
         return false;
     };
-    if p.vendor_id != vid || p.product_id != pid {
+    if vendor_id != vid || product_id != pid {
         return false;
     }
-    match parts.get(2) {
-        Some(serial) => p.serial_number.as_deref() == Some(*serial),
+    match parts.next() {
+        Some(wanted) => serial.is_some_and(|s| s.eq_ignore_ascii_case(wanted)),
         None => true,
     }
 }
@@ -514,6 +522,38 @@ impl Drop for RttSource {
 mod tests {
     use super::*;
     use probe_rs::config::Registry;
+
+    #[test]
+    fn selector_keeps_colons_in_serial() {
+        let serial = Some("1C:DB:D4:48:ED:98");
+        assert!(selector_matches(
+            "303a:1001:1C:DB:D4:48:ED:98",
+            0x303a,
+            0x1001,
+            serial
+        ));
+        assert!(selector_matches(
+            "303a:1001:1c:db:d4:48:ed:98",
+            0x303a,
+            0x1001,
+            serial
+        ));
+        assert!(!selector_matches("303a:1001:1C", 0x303a, 0x1001, serial));
+        assert!(!selector_matches(
+            "303a:1001:58:E6:C5:17:35:7C",
+            0x303a,
+            0x1001,
+            serial
+        ));
+    }
+
+    #[test]
+    fn selector_vid_pid_only() {
+        assert!(selector_matches("0x303a:1001", 0x303a, 0x1001, None));
+        assert!(!selector_matches("303a:1002", 0x303a, 0x1001, None));
+        assert!(!selector_matches("303a:1001:ABC", 0x303a, 0x1001, None));
+        assert!(!selector_matches("303a", 0x303a, 0x1001, None));
+    }
 
     /// probe-rs 0.32 moved all Espressif support out of the core crate, so ESP
     /// chips only resolve once [`register_espressif`] has run. These assertions
