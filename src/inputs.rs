@@ -247,6 +247,10 @@ pub struct MonitorInput {
     /// If it has a `.defmt` section, output is decoded as defmt (structured
     /// levels/modules); otherwise plain text. Must match the running firmware.
     pub elf: Option<String>,
+    /// Output decoding: "auto" (default; defmt if the ELF has a `.defmt` section, else
+    /// text), "text" (never decode, ignore the ELF), or "defmt" (require a defmt table;
+    /// error if the ELF has none).
+    pub decode: Option<String>,
     /// defmt only: stop on the first frame at or above this level
     /// (trace/debug/info/warn/error) - the "did it panic?" button.
     pub stop_on_level: Option<String>,
@@ -339,6 +343,10 @@ pub struct FlashMonitorInput {
     /// ELF is being flashed (so a defmt build is decoded automatically). If it has
     /// no `.defmt` section, output is plain text.
     pub elf: Option<String>,
+    /// Output decoding: "auto" (default; defmt if the ELF has a `.defmt` section, else
+    /// text), "text" (never decode, ignore the ELF), or "defmt" (require a defmt table;
+    /// error if the ELF has none).
+    pub decode: Option<String>,
     /// defmt only: stop on the first frame at or above this level (trace/debug/info/warn/error).
     pub stop_on_level: Option<String>,
     /// defmt only: minimum level to show (default: show everything).
@@ -409,6 +417,10 @@ pub struct RerunInput {
     /// Path to the firmware ELF for defmt decode. Auto-detected (the build
     /// artifact) if omitted. `.defmt` section present → defmt, else plain text.
     pub elf: Option<String>,
+    /// Output decoding: "auto" (default; defmt if the ELF has a `.defmt` section, else
+    /// text), "text" (never decode, ignore the ELF), or "defmt" (require a defmt table;
+    /// error if the ELF has none).
+    pub decode: Option<String>,
     /// defmt only: stop on the first frame at or above this level (trace/debug/info/warn/error).
     pub stop_on_level: Option<String>,
     /// defmt only: minimum level to show (default: show everything).

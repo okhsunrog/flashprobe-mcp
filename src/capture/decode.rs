@@ -15,6 +15,9 @@ pub fn load_defmt_table(elf_path: &str) -> Result<Option<(Table, Vec<u8>)>, Stri
     match Table::parse(&bytes) {
         Ok(Some(table)) => Ok(Some((table, bytes))),
         Ok(None) => Ok(None),
+        // The defmt crate is linked (its version symbol is present) but the firmware never
+        // used it, so there is no `.defmt` section: that is a text-mode ELF, not an error.
+        Err(e) if e.to_string().contains(".defmt") => Ok(None),
         Err(e) => Err(format!(
             "Failed to parse defmt table from '{elf_path}': {e}"
         )),

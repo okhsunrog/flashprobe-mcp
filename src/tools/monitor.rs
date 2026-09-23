@@ -103,7 +103,7 @@ impl Server {
             let defmt = if source.text_only() {
                 None
             } else {
-                load_optional_table(elf.as_deref())?
+                load_optional_table(elf.as_deref(), input.decode.as_deref())?
             };
             let mode = decode_mode(&defmt, framing);
             send_delay(opts.send.as_ref(), input.send_delay_ms);
@@ -224,7 +224,7 @@ impl Server {
             let defmt = if source.text_only() {
                 None
             } else {
-                load_optional_table(elf_path.as_deref())?
+                load_optional_table(elf_path.as_deref(), input.decode.as_deref())?
             };
             let mode = decode_mode(&defmt, framing);
             send_delay(opts.send.as_ref(), input.send_delay_ms);
@@ -303,7 +303,7 @@ impl Server {
             let defmt = match &conn {
                 #[cfg(feature = "probe-rs")]
                 Conn::Jtag(_, probers::CaptureTransport::Semihosting) => None,
-                _ => load_optional_table(elf.as_deref())?,
+                _ => load_optional_table(elf.as_deref(), input.decode.as_deref())?,
             };
             // Parsed once; every cycle re-sends it after its own reset.
             let send = input.send.as_deref().map(parse_escapes).transpose()?;
@@ -487,10 +487,28 @@ fn send_note(send: Option<&Vec<u8>>) -> String {
 
 /// Load a defmt table from an optional ELF path (None → text mode).
 type DefmtTable = (defmt_decoder::Table, Vec<u8>);
-fn load_optional_table(elf: Option<&str>) -> Result<Option<DefmtTable>, String> {
-    match elf {
-        Some(path) => load_defmt_table(path),
-        None => Ok(None),
+fn load_optional_table(
+    elf: Option<&str>,
+    decode: Option<&str>,
+) -> Result<Option<DefmtTable>, String> {
+    match decode.map(|d| d.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("auto") | Some("") => match elf {
+            Some(path) => load_defmt_table(path),
+            None => Ok(None),
+        },
+        Some("text") => Ok(None),
+        Some("defmt") => match elf {
+            Some(path) => match load_defmt_table(path)? {
+                Some(table) => Ok(Some(table)),
+                None => Err(format!(
+                    "decode=\"defmt\" but '{path}' has no `.defmt` section"
+                )),
+            },
+            None => Err("decode=\"defmt\" needs an ELF (pass `elf` or build the project)".into()),
+        },
+        Some(other) => Err(format!(
+            "Unknown decode mode '{other}' (use auto, text or defmt)"
+        )),
     }
 }
 
