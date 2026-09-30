@@ -6,6 +6,8 @@ pub mod espflash;
 pub mod probers;
 #[cfg(feature = "probe-rs")]
 pub mod semihosting;
+#[cfg(feature = "probe-rs")]
+pub mod stacktrace;
 
 /// Which backend a tool call should use.
 pub enum BackendKind {

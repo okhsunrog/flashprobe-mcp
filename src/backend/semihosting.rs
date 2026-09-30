@@ -1,15 +1,24 @@
-//! Semihosting console capture and the embedded-test host protocol.
-//! Syscall decoding, target buffers and responses are owned by probe-rs.
-use crate::capture::ByteSource;
+//! Semihosting console capture and the embedded-test host protocol, with the
+//! firmware's RTT log read alongside. Syscall decoding, target buffers and
+//! responses are owned by probe-rs.
+use crate::backend::stacktrace::StackTracer;
+use crate::capture::{ByteSource, Stream};
 use anyhow::{Context, Result, bail};
 use object::{Object, ObjectSection, ObjectSymbol, SymbolKind};
-use probe_rs::{BreakpointCause, CoreStatus, HaltReason, Session, semihosting::SemihostingCommand};
+use probe_rs::rtt::{ChannelMode, Rtt, ScanRegion};
+use probe_rs::{
+    BreakpointCause, Core, CoreStatus, HaltReason, MemoryInterface, Session,
+    semihosting::SemihostingCommand,
+};
 use serde::Deserialize;
 use std::{
     collections::VecDeque,
     num::NonZeroU32,
     time::{Duration, Instant},
 };
+
+/// Per-test timeout when the test declares none, as in embedded-test.
+const DEFAULT_TEST_TIMEOUT_S: u32 = 60;
 
 #[derive(Debug, Deserialize)]
 struct Test {
@@ -19,6 +28,21 @@ struct Test {
     timeout: Option<u32>,
     #[serde(skip)]
     address: Option<u32>,
+}
+
+impl Test {
+    fn timeout(&self) -> Duration {
+        Duration::from_secs(self.timeout.unwrap_or(DEFAULT_TEST_TIMEOUT_S) as u64)
+    }
+}
+
+/// Whether the ELF is an embedded-test binary. Such firmware stops at a
+/// semihosting request before its `#[init]` and waits for a runner, so it
+/// cannot be captured by only reading RTT.
+pub fn is_embedded_test(data: &[u8]) -> Result<bool> {
+    Ok(object::File::parse(data)?
+        .section_by_name(".embedded_test")
+        .is_some())
 }
 
 /// None means ordinary firmware; Some includes an empty embedded-test suite.
@@ -83,6 +107,9 @@ struct Suite {
     passed: usize,
     failed: usize,
     ignored: usize,
+    /// When the whole run began, for the summary.
+    began: Instant,
+    /// When the current test's reset happened; its timeout counts from here.
     started: Instant,
     commanded: bool,
     next: bool,
@@ -96,47 +123,225 @@ impl Suite {
             passed: 0,
             failed: 0,
             ignored: 0,
+            began: Instant::now(),
             started: Instant::now(),
             commanded: false,
             next: true,
         }
     }
-    fn result(&mut self, panic: bool, failure: Option<&str>) -> String {
+
+    /// Why the current test failed, given how it ended; `None` if it passed.
+    fn failure(&self, panic: bool, timeout: bool) -> Option<&'static str> {
         let test = &self.tests[self.index];
-        let success = failure.is_none() && self.commanded && panic == test.should_panic;
-        if success {
-            self.passed += 1;
+        if timeout {
+            Some("test timeout")
+        } else if !self.commanded {
+            Some("exited before the runner sent it a test")
+        } else if panic && !test.should_panic {
+            // embedded-test aborts both on a panic and on an `Err` return;
+            // the firmware log above says which.
+            Some("panicked or returned Err")
+        } else if !panic && test.should_panic {
+            Some("expected a panic, but the test passed")
         } else {
-            self.failed += 1;
+            None
         }
-        let suffix = failure.map(|s| format!(" ({s})")).unwrap_or_default();
-        let line = format!(
-            "test {} ... {}{suffix}\n",
-            test.name,
-            if success { "ok" } else { "FAILED" }
-        );
+    }
+
+    fn result(&mut self, failure: Option<&str>) -> String {
+        let test = &self.tests[self.index];
+        let line = match failure {
+            None => {
+                self.passed += 1;
+                format!("test {} ... ok\n", test.name)
+            }
+            Some(why) => {
+                self.failed += 1;
+                format!("test {} ... FAILED ({why})\n", test.name)
+            }
+        };
         self.index += 1;
         self.next = true;
         line
     }
+
     fn summary(&self) -> String {
         format!(
-            "test result: {}. {} passed; {} failed; {} ignored\n",
+            "test result: {}. {} passed; {} failed; {} ignored; finished in {:.2}s\n",
             if self.failed == 0 { "ok" } else { "FAILED" },
             self.passed,
             self.failed,
-            self.ignored
+            self.ignored,
+            self.began.elapsed().as_secs_f64()
         )
+    }
+
+    /// The longest the remaining tests can take: each one's timeout plus a
+    /// second for its reset and boot, and some slack for the runner.
+    fn budget(&self) -> Duration {
+        self.tests[self.index..]
+            .iter()
+            .filter(|t| !t.ignored)
+            .map(|t| t.timeout() + Duration::from_secs(1))
+            .sum::<Duration>()
+            + Duration::from_secs(5)
+    }
+}
+
+/// What the source has produced and not yet handed to the capture loop, in
+/// the order it happened, each chunk tagged with its stream.
+#[derive(Default)]
+struct Output {
+    chunks: VecDeque<(Stream, Vec<u8>)>,
+    /// Last runner byte queued, so a runner line never joins a console write
+    /// that did not end its line.
+    runner_tail: Option<u8>,
+}
+
+impl Output {
+    fn push(&mut self, stream: Stream, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        if stream == Stream::Runner {
+            self.runner_tail = bytes.last().copied();
+        }
+        match self.chunks.back_mut() {
+            Some((last, chunk)) if *last == stream => chunk.extend_from_slice(bytes),
+            _ => self.chunks.push_back((stream, bytes.to_vec())),
+        }
+    }
+
+    /// A runner status line, which has to start a line of its own.
+    fn line(&mut self, text: &str) {
+        if self.runner_tail.is_some_and(|b| b != b'\n') {
+            self.push(Stream::Runner, b"\n");
+        }
+        self.push(Stream::Runner, text.as_bytes());
+    }
+
+    fn read(&mut self, buf: &mut [u8]) -> Option<(usize, Stream)> {
+        let (stream, chunk) = self.chunks.front_mut()?;
+        let stream = *stream;
+        let n = buf.len().min(chunk.len());
+        buf[..n].copy_from_slice(&chunk[..n]);
+        chunk.drain(..n);
+        if chunk.is_empty() {
+            self.chunks.pop_front();
+        }
+        Some((n, stream))
+    }
+
+    fn is_empty(&self) -> bool {
+        self.chunks.is_empty()
+    }
+}
+
+/// The firmware's RTT log, read while semihosting drives the target.
+///
+/// embedded-test firmware logs over defmt-rtt or rtt-target while the runner
+/// talks to it over semihosting. `probe-rs run` reads both, and a test result
+/// without the log that explains it is not much use, so this does too.
+struct RttLog {
+    /// `_SEGGER_RTT` from the ELF. Only an exact address is cheap enough to
+    /// retry on every poll until the firmware initializes RTT.
+    addr: u64,
+    rtt: Option<Rtt>,
+    /// The firmware's own up-channel mode, put back when the capture ends.
+    restore_mode: Option<ChannelMode>,
+    attached_once: bool,
+}
+
+impl RttLog {
+    fn new(addr: u64) -> Self {
+        Self {
+            addr,
+            rtt: None,
+            restore_mode: None,
+            attached_once: false,
+        }
+    }
+
+    /// Zero the control block on a halted core, so the next attach finds the
+    /// one the firmware writes after this reset rather than the last run's.
+    fn invalidate(&mut self, core: &mut Core<'_>) -> Result<()> {
+        core.write(self.addr, &vec![0u8; Rtt::control_block_size()])?;
+        self.rtt = None;
+        self.restore_mode = None;
+        Ok(())
+    }
+
+    /// Attach once the firmware has initialized RTT, then queue everything in
+    /// up-channel 0.
+    fn drain(&mut self, core: &mut Core<'_>, output: &mut Output) -> Result<()> {
+        if self.rtt.is_none() {
+            let Ok(mut rtt) = Rtt::attach_region(core, &ScanRegion::Exact(self.addr)) else {
+                return Ok(()); // Not initialized yet; try again next poll.
+            };
+            // Block rather than drop while the host is reading: a test that
+            // logs faster than the runner polls would otherwise lose lines.
+            if let Some(up) = rtt.up_channel(0) {
+                self.restore_mode = Some(up.mode(core)?);
+                up.set_mode(core, ChannelMode::BlockIfFull)?;
+            }
+            self.rtt = Some(rtt);
+            self.attached_once = true;
+        }
+        let Some(up) = self.rtt.as_mut().and_then(|rtt| rtt.up_channel(0)) else {
+            return Ok(());
+        };
+        let mut buf = [0u8; 1024];
+        loop {
+            let n = up.read(core, &mut buf)?;
+            if n == 0 {
+                return Ok(());
+            }
+            output.push(Stream::Firmware, &buf[..n]);
+        }
+    }
+
+    fn restore(&mut self, core: &mut Core<'_>) -> Result<()> {
+        if let (Some(mode), Some(up)) = (
+            self.restore_mode.take(),
+            self.rtt.as_mut().and_then(|rtt| rtt.up_channel(0)),
+        ) {
+            up.set_mode(core, mode)?;
+        }
+        Ok(())
+    }
+}
+
+/// Reset into a fresh run, with the old RTT control block cleared first.
+fn restart(session: &mut Session, rtt: Option<&mut RttLog>) -> Result<()> {
+    let mut core = session.core(0)?;
+    core.reset_and_halt(Duration::from_millis(500))?;
+    if let Some(rtt) = rtt {
+        rtt.invalidate(&mut core)?;
+    }
+    core.run()?;
+    Ok(())
+}
+
+/// Queue a stack trace of the halted core for a failed test.
+fn trace_failure(tracer: Option<&mut StackTracer>, core: &mut Core<'_>, output: &mut Output) {
+    if let Some(tracer) = tracer {
+        let trace = tracer
+            .trace(core)
+            .unwrap_or_else(|e| format!("(no stack trace: {e})\n"));
+        output.line(&trace);
     }
 }
 
 pub struct SemihostingSource {
     session: Session,
-    pending: VecDeque<u8>,
+    output: Output,
     handles: Vec<bool>,
     suite: Option<Suite>,
+    rtt: Option<RttLog>,
+    tracer: Option<StackTracer>,
+    /// Unwind the stack for each failed test, as `probe-rs run` does.
+    trace_failures: bool,
     done: bool,
-    last_byte: Option<u8>,
 }
 
 impl SemihostingSource {
@@ -145,16 +350,23 @@ impl SemihostingSource {
         elf: Option<&str>,
         reset: bool,
         verify_flash: bool,
+        trace_failures: bool,
     ) -> Result<Self, String> {
-        let tests = elf
-            .map(|path| {
-                std::fs::read(path)
-                    .with_context(|| format!("reading {path}"))
-                    .and_then(|data| tests_from_elf(&data))
-            })
+        let data = elf
+            .map(|path| std::fs::read(path).with_context(|| format!("reading {path}")))
+            .transpose()
+            .map_err(|e| format!("Semihosting ELF: {e:#}"))?;
+        let tests = data
+            .as_deref()
+            .map(tests_from_elf)
             .transpose()
             .map_err(|e| format!("Semihosting ELF: {e:#}"))?
             .flatten();
+        let mut rtt = data
+            .as_deref()
+            .and_then(|d| probe_rs::rtt::find_rtt_control_block_in_raw_file(d).ok())
+            .flatten()
+            .map(RttLog::new);
         // The runner drives the target by addresses read from this ELF, so the
         // flash has to hold this very build. A stale image runs the wrong code
         // at those addresses and dies with exceptions that look like firmware
@@ -171,43 +383,30 @@ impl SemihostingSource {
                 ));
             }
         }
-        if reset || tests.is_some() {
-            let mut core = session.core(0).map_err(|e| e.to_string())?;
-            core.reset_and_halt(Duration::from_millis(500))
-                .map_err(|e| e.to_string())?;
-            core.run().map_err(|e| e.to_string())?;
-        }
         // Test harnesses need a fresh command-line request for every case,
         // including the first: without an attached debugger, ESP semihosting
         // traps can already have become firmware exceptions. Ordinary apps
         // retain attach-only monitor semantics.
+        if reset || tests.is_some() {
+            restart(&mut session, rtt.as_mut()).map_err(|e| e.to_string())?;
+        }
+        let mut output = Output::default();
         let suite = tests.map(|tests| {
+            output.line(&format!("running {} tests\n", tests.len()));
             let mut suite = Suite::new(tests);
             suite.next = false;
             suite
         });
         Ok(Self {
             session,
-            pending: VecDeque::new(),
+            output,
             handles: Vec::new(),
             suite,
+            rtt,
+            tracer: elf.map(StackTracer::new),
+            trace_failures,
             done: false,
-            last_byte: None,
         })
-    }
-
-    fn emit(&mut self, text: &str) {
-        // Harness status lines must not join an unterminated console write.
-        if self
-            .pending
-            .back()
-            .copied()
-            .or(self.last_byte)
-            .is_some_and(|b| b != b'\n')
-        {
-            self.pending.push_back(b'\n');
-        }
-        self.pending.extend(text.as_bytes());
     }
 
     fn poll(&mut self) -> Result<()> {
@@ -216,38 +415,48 @@ impl SemihostingSource {
         }
         if let Some(suite) = &mut self.suite {
             while suite.index < suite.tests.len() && suite.tests[suite.index].ignored {
-                self.pending.extend(
-                    format!("test {} ... ignored\n", suite.tests[suite.index].name).bytes(),
-                );
+                self.output.line(&format!(
+                    "test {} ... ignored\n",
+                    suite.tests[suite.index].name
+                ));
                 suite.ignored += 1;
                 suite.index += 1;
             }
             if suite.index == suite.tests.len() {
-                let summary = suite.summary();
-                self.emit(&summary);
+                self.output.line(&suite.summary());
                 self.done = true;
                 return Ok(());
             }
             if suite.next {
-                let mut core = self.session.core(0)?;
-                core.reset_and_halt(Duration::from_millis(500))?;
-                core.run()?;
+                restart(&mut self.session, self.rtt.as_mut())?;
                 self.handles.clear();
                 suite.started = Instant::now();
                 suite.commanded = false;
                 suite.next = false;
             }
-            let timeout =
-                Duration::from_secs(suite.tests[suite.index].timeout.unwrap_or(60) as u64);
-            if suite.started.elapsed() >= timeout {
-                self.session.core(0)?.halt(Duration::from_millis(500))?;
-                let line = suite.result(false, Some("test timeout"));
-                self.emit(&line);
+            if suite.started.elapsed() >= suite.tests[suite.index].timeout() {
+                let mut core = self.session.core(0)?;
+                core.halt(Duration::from_millis(500))?;
+                if let Some(rtt) = &mut self.rtt {
+                    rtt.drain(&mut core, &mut self.output)?;
+                }
+                if self.trace_failures {
+                    trace_failure(self.tracer.as_mut(), &mut core, &mut self.output);
+                }
+                let line = suite.result(suite.failure(false, true));
+                self.output.line(&line);
                 return Ok(());
             }
         }
         let mut core = self.session.core(0)?;
-        let command = match core.status()? {
+        let status = core.status()?;
+        // RTT after the status: a core seen halted has already written
+        // everything it logged before stopping, so that log is queued ahead
+        // of whatever the runner reports about the halt.
+        if let Some(rtt) = &mut self.rtt {
+            rtt.drain(&mut core, &mut self.output)?;
+        }
+        let command = match status {
             CoreStatus::Halted(HaltReason::Breakpoint(BreakpointCause::Semihosting(command))) => {
                 command
             }
@@ -259,16 +468,19 @@ impl SemihostingSource {
         };
         match command {
             SemihostingCommand::ExitSuccess | SemihostingCommand::ExitError(_) => {
-                drop(core);
                 let panic = matches!(command, SemihostingCommand::ExitError(_));
                 if let Some(suite) = &mut self.suite {
                     if !suite.commanded {
                         bail!("embedded-test exited before requesting its test command");
                     }
-                    let line = suite.result(panic, None);
-                    self.emit(&line);
+                    let failure = suite.failure(panic, false);
+                    if failure.is_some() && self.trace_failures {
+                        trace_failure(self.tracer.as_mut(), &mut core, &mut self.output);
+                    }
+                    let line = suite.result(failure);
+                    self.output.line(&line);
                 } else {
-                    self.emit(&match command {
+                    self.output.line(&match command {
                         SemihostingCommand::ExitError(details) => {
                             format!("\nsemihosting exit: {details}\n")
                         }
@@ -319,7 +531,8 @@ impl SemihostingSource {
                 }
             }
             SemihostingCommand::WriteConsole(request) => {
-                self.pending.extend(request.read(&mut core)?.bytes())
+                let text = request.read(&mut core)?;
+                self.output.push(Stream::Runner, text.as_bytes());
             }
             SemihostingCommand::Write(request) => {
                 // Handles 1/2 also allow attach to a program which already opened stdout/stderr.
@@ -334,7 +547,8 @@ impl SemihostingSource {
                         .unwrap_or(false)
                 };
                 if valid {
-                    self.pending.extend(request.read(&mut core)?);
+                    let bytes = request.read(&mut core)?;
+                    self.output.push(Stream::Runner, &bytes);
                     request.write_status(&mut core, 0)?;
                 }
             }
@@ -356,29 +570,63 @@ impl SemihostingSource {
 
 impl ByteSource for SemihostingSource {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if self.pending.is_empty() {
+        self.read_tagged(buf).map(|(n, _)| n)
+    }
+    fn read_tagged(&mut self, buf: &mut [u8]) -> std::io::Result<(usize, Stream)> {
+        if self.output.is_empty() {
             self.poll()
                 .map_err(|e| std::io::Error::other(format!("{e:#}")))?;
         }
-        let n = buf.len().min(self.pending.len());
-        for byte in &mut buf[..n] {
-            *byte = self.pending.pop_front().unwrap();
-        }
-        if n > 0 {
-            self.last_byte = Some(buf[n - 1]);
-        }
-        Ok(n)
+        Ok(self.output.read(buf).unwrap_or((0, Stream::Runner)))
     }
     // There is no target-side ring buffer to flush. Servicing a pending syscall
     // produces fresh output; draining it would also execute tests before capture.
     fn text_only(&self) -> bool {
-        true
+        self.rtt.is_none()
     }
     fn finished(&self) -> bool {
-        self.done && self.pending.is_empty()
+        self.done && self.output.is_empty()
     }
     fn idle_nap(&self) -> Duration {
         Duration::from_millis(1)
+    }
+    fn run_budget(&self) -> Option<Duration> {
+        self.suite.as_ref().map(Suite::budget)
+    }
+    fn note(&self) -> Option<String> {
+        let rtt = self.rtt.as_ref()?;
+        (!rtt.attached_once).then(|| {
+            format!(
+                "RTT: the ELF defines `_SEGGER_RTT` at {:#x}, but the firmware never \
+                 initialized it during this capture, so no firmware log is shown. \
+                 embedded-test logging usually starts in `#[init]`; a run that fails \
+                 before that logs nothing.",
+                rtt.addr
+            )
+        })
+    }
+    /// A suite has already traced each failed test in place.
+    fn stack_trace(&mut self) -> Option<Result<String, String>> {
+        if self.suite.is_some() {
+            return None;
+        }
+        let tracer = self.tracer.as_mut()?;
+        Some(tracer.trace_session(&mut self.session))
+    }
+}
+
+impl Drop for SemihostingSource {
+    fn drop(&mut self) {
+        if let Some(rtt) = &mut self.rtt {
+            let restored = self
+                .session
+                .core(0)
+                .map_err(anyhow::Error::from)
+                .and_then(|mut core| rtt.restore(&mut core));
+            if let Err(error) = restored {
+                tracing::warn!("Failed to restore the RTT channel mode: {error:#}");
+            }
+        }
     }
 }
 
@@ -440,22 +688,72 @@ mod tests {
         assert!(tests_from_elf(&fixture(1, "bad json")).is_err());
     }
     #[test]
+    fn embedded_test_section_identifies_test_elfs() {
+        assert!(is_embedded_test(&fixture(1, META)).unwrap());
+        let plain = Object::new(BinaryFormat::Elf, Architecture::Riscv32, Endianness::Little);
+        assert!(!is_embedded_test(&plain.write().unwrap()).unwrap());
+    }
+    #[test]
     fn panic_expectations_and_timeouts_affect_summary() {
         let tests = tests_from_elf(&fixture(1, META)).unwrap().unwrap();
         let mut suite = Suite::new(tests);
         suite.commanded = true;
-        assert!(suite.result(true, None).contains("... ok"));
-        assert_eq!(
-            suite.summary(),
-            "test result: ok. 1 passed; 0 failed; 0 ignored\n"
-        );
-        let mut suite = Suite::new(tests_from_elf(&fixture(1, META)).unwrap().unwrap());
-        suite.commanded = true;
+        let failure = suite.failure(true, false);
+        assert_eq!(failure, None);
+        assert!(suite.result(failure).contains("... ok"));
         assert!(
             suite
-                .result(false, Some("test timeout"))
-                .contains("FAILED (test timeout)")
+                .summary()
+                .starts_with("test result: ok. 1 passed; 0 failed; 0 ignored; finished in ")
         );
+
+        let mut suite = Suite::new(tests_from_elf(&fixture(1, META)).unwrap().unwrap());
+        suite.commanded = true;
+        let failure = suite.failure(false, true);
+        assert!(suite.result(failure).contains("FAILED (test timeout)"));
         assert!(suite.summary().contains("0 passed; 1 failed"));
+
+        // A should_panic test that returns normally fails, and says why.
+        let mut suite = Suite::new(tests_from_elf(&fixture(1, META)).unwrap().unwrap());
+        suite.commanded = true;
+        let failure = suite.failure(false, false);
+        assert!(suite.result(failure).contains("expected a panic"));
+    }
+    #[test]
+    fn budget_covers_every_remaining_timeout() {
+        let suite = Suite::new(tests_from_elf(&fixture(1, META)).unwrap().unwrap());
+        // One test with a 3 s timeout: 3 s + 1 s reset + 5 s slack.
+        assert_eq!(suite.budget(), Duration::from_secs(9));
+    }
+    #[test]
+    fn runner_lines_start_on_their_own_line_and_keep_order() {
+        let mut out = Output::default();
+        out.push(Stream::Runner, b"console without newline");
+        out.push(Stream::Firmware, b"\x01\x02");
+        out.line("test a ... ok\n");
+        let mut buf = [0u8; 64];
+        let mut chunks = Vec::new();
+        while let Some((n, stream)) = out.read(&mut buf) {
+            chunks.push((stream, buf[..n].to_vec()));
+        }
+        assert_eq!(
+            chunks,
+            vec![
+                (Stream::Runner, b"console without newline".to_vec()),
+                (Stream::Firmware, vec![1, 2]),
+                (Stream::Runner, b"\ntest a ... ok\n".to_vec()),
+            ]
+        );
+    }
+    #[test]
+    fn a_chunk_larger_than_the_buffer_is_read_in_parts() {
+        let mut out = Output::default();
+        out.push(Stream::Firmware, b"abcdef");
+        let mut buf = [0u8; 4];
+        assert_eq!(out.read(&mut buf), Some((4, Stream::Firmware)));
+        assert_eq!(&buf, b"abcd");
+        assert_eq!(out.read(&mut buf), Some((2, Stream::Firmware)));
+        assert_eq!(&buf[..2], b"ef");
+        assert!(out.is_empty());
     }
 }

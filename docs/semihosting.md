@@ -1,8 +1,11 @@
 # Semihosting capture
 
-The probe-rs backend now selects RTT for an ELF defining `_SEGGER_RTT`, or
-semihosting otherwise. `transport: "rtt"` / `"semihosting"` override selection;
-without an ELF, auto retains the previous RTT RAM scan.
+The probe-rs backend runs an ELF with an `.embedded_test` section over
+semihosting. Any other ELF gets RTT when it defines `_SEGGER_RTT`, or
+semihosting otherwise. `transport: "rtt"` / `"semihosting"` override selection,
+except that `"rtt"` is refused for an embedded-test ELF; without an ELF, auto
+retains the previous RTT RAM scan. See "RTT alongside semihosting" below for
+why the section is checked first.
 
 `SemihostingSource` implements the same `ByteSource` interface as RTT and serial.
 It services core 0 using probe-rs' decoded semihosting requests and target-buffer
@@ -121,3 +124,74 @@ Verified on the same board on 2026-09-09 with a fresh release binary over
 
 The committed firmware was restored with `probe-rs run --preverify` afterwards
 (40/40).
+
+## RTT alongside semihosting
+
+An embedded-test binary usually logs over defmt-rtt or rtt-target, which its
+`#[init]` sets up. The ELF therefore defines `_SEGGER_RTT`, and auto used to
+pick RTT for it on that symbol alone. That can never work: embedded-test stops
+at a semihosting `SYS_GET_CMDLINE` before `#[init]` and waits for a runner, so
+`flash_monitor` reported "RTT control block did not appear" and `monitor`
+"Failed to attach RTT". Forcing semihosting ran the suite, but showed only the
+runner's verdicts and none of the defmt log that explains a failure.
+
+Auto now checks the `.embedded_test` section first. The semihosting source
+reads RTT up-channel 0 in the same loop that services semihosting, the way
+`probe-rs run` combines its RTT poller with the test runner:
+
+- Before each test's reset, the RTT control block is zeroed, so the attach can
+  only find the block that test's `#[init]` writes. Attach is retried on every
+  poll at the ELF's `_SEGGER_RTT` address.
+- Each poll reads the core status first and drains RTT second. A core seen
+  halted at an exit trap has already written everything it logged, so a test's
+  log is queued ahead of its verdict.
+- RTT bytes and runner text travel as separate tagged streams. RTT goes through
+  the defmt or text decoder; runner lines go through their own text decoder and
+  survive the `level` and `module` filters.
+- The up-channel is switched to `BlockIfFull` while the host reads, and the
+  firmware's mode is restored when the capture ends.
+
+A failed test, including a timeout, gets a stack trace before its `FAILED`
+line, unwound with `probe-rs-debug` from the ELF the way `probe-rs run` does it.
+A suite also sets its own capture bounds: an unset `timeout_s` becomes the sum
+of the remaining per-test timeouts plus a second each and 5 s of slack, and an
+unset `idle_ms` does not apply.
+
+When RTT still does not come up in an RTT capture, the error now reads the
+core's state: a core halted at `SYS_GET_CMDLINE` is reported as an
+embedded-test binary waiting for its runner, with the transport to use.
+
+### Hardware evidence, 2026-09-30
+
+ESP32-C5, ESP JTAG `303a:1001:3C:DC:75:8E:15:98` (a second probe was connected,
+so every call passed `probe`). probe-rs CLI 0.32.0 for the reference runs. Each
+MCP check launched a fresh release executable over stdio via
+`uv run mcp_probe.py`.
+
+Suite under investigation: `canfd-ergot-testing` `tests/ergot_can.rs`
+(embedded-test 0.7.2, esp-rtos executor, defmt over rtt-target initialized in
+`#[init]`), ELF SHA-256
+`2c505d2a0187160bd5f0a0288d4342e17c44bbb43bcef0af8e5060e5e17d3d12`.
+
+| Check | Before | After |
+| --- | --- | --- |
+| `flash_monitor`, only backend/chip/probe/file | RTT control block timeout after 1.5 s | `via semihosting + RTT`, 2/2 ok, defmt log before each verdict, returned on completion in 10.7 s |
+| `flash`, then `monitor` auto | RTT attach timeout | Same suite output as above |
+| `monitor`, `transport: "semihosting"` | Verdicts only, no defmt | Same suite output as above |
+| `monitor`, `transport: "rtt"` | RTT attach timeout | Refused up front, naming the embedded-test cause |
+| `rerun` with a plain-app ELF while the test ELF is flashed | Not run; same code path as the first row, whose error lists generic RTT causes | "halted at a semihosting SYS_GET_CMDLINE request ... embedded-test" |
+
+Panic fixture (built in a scratch project against the same esp-hal revision):
+a suite with a passing test, a `defmt::panic!` from a nested call, a
+`should_panic` test, an `Err` return, and a `#[timeout(2)]` test that never
+finishes; and a plain `panic-rtt-target` app that panics after four ticks.
+
+| Check | Observed result |
+| --- | --- |
+| Suite, `probe-rs run` vs `flash_monitor` | Same defmt lines and verdicts (2 passed, 3 failed); all stack trace frame and location lines identical for the panic, the `Err` return and the timeout |
+| Suite, `rerun` after the flash | Same output; flash verification passed |
+| Plain app, `probe-rs run --always-print-stacktrace` + Ctrl+C vs `flash_monitor` | Same panic message lines; the automatic trace's 20 frames and locations identical |
+| Plain RTT app without a panic (`canfd-ergot-testing` bin) | No trace section, output as before |
+| Semihosting-only suite (`misc_drivers`, no RTT) | `via semihosting`, text mode, 13/13 |
+
+The suite binary under investigation was left flashed on the board.

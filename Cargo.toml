@@ -12,6 +12,7 @@ espflash = { version = "4.5.0", default-features = false, features = ["serialpor
 md5 = "0.8"
 object = { version = "0.40.0", features = ["read"], optional = true, package = "object" }
 probe-rs = { version = "0.32", optional = true }
+probe-rs-debug = { version = "0.32", optional = true }
 probe-rs-espressif = { version = "0.32", optional = true }
 regex = "1.13.1"
 rmcp = { version = "3.1.3", features = ["server", "transport-io"] }
@@ -29,7 +30,13 @@ default = ["probe-rs"]
 # --no-default-features for a lean espflash-only (serial) build.
 # Since probe-rs 0.32, Espressif targets/sequences/IDF image format live in the
 # separate probe-rs-espressif crate, so ESP-over-SWD needs both.
-probe-rs = ["dep:probe-rs", "dep:probe-rs-espressif", "dep:object"]
+# probe-rs-debug unwinds the stack for the traces shown after a panic.
+probe-rs = [
+  "dep:probe-rs",
+  "dep:probe-rs-debug",
+  "dep:probe-rs-espressif",
+  "dep:object",
+]
 
 [dev-dependencies]
 filetime = "0.2.29"

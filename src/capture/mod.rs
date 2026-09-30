@@ -12,7 +12,7 @@ pub mod render;
 pub mod source;
 
 pub use decode::{Decode, DefmtDecoder, DefmtFraming, DefmtStats, Level, Line, TextDecoder};
-pub use source::ByteSource;
+pub use source::{ByteSource, Stream};
 
 use defmt_decoder::Table;
 use regex::Regex;
@@ -111,6 +111,10 @@ pub struct CaptureResult {
     pub pending: String,
     /// Total bytes read from the source.
     pub raw_bytes: usize,
+    /// The part of `raw_bytes` that came on [`Stream::Firmware`], i.e. what the
+    /// defmt decoder saw. Runner text is not defmt and says nothing about
+    /// whether the ELF matches the firmware.
+    pub firmware_bytes: usize,
     pub stop_reason: StopReason,
     pub matched: bool,
     pub truncated: bool,
@@ -134,9 +138,23 @@ pub fn raw_text(result: &CaptureResult) -> String {
     s
 }
 
+/// Both decoders' unterminated tails, runner text last.
+fn pending_tail(decoder: &dyn Decode, runner: &TextDecoder) -> Option<String> {
+    let tails: Vec<&str> = [decoder.pending(), runner.pending()]
+        .into_iter()
+        .flatten()
+        .filter(|t| !t.is_empty())
+        .collect();
+    (!tails.is_empty()).then(|| tails.join("\n"))
+}
+
 /// Run the bounded, early-exiting capture loop. Stops on the first of: a stop
 /// match (then lingers briefly for the matched line to complete), the wall-clock
 /// timeout, the idle timeout, or the byte cap.
+///
+/// `decoder` handles [`Stream::Firmware`]; [`Stream::Runner`] text goes
+/// through its own [`TextDecoder`], so a partial line on one stream never
+/// swallows the start of a line on the other.
 pub fn run_capture(
     source: &mut dyn ByteSource,
     decoder: &mut dyn Decode,
@@ -151,8 +169,10 @@ pub fn run_capture(
         source::send_all(source, data)?;
     }
 
+    let mut runner = TextDecoder::new();
     let mut lines: Vec<Line> = Vec::new();
     let mut raw_bytes = 0usize;
+    let mut firmware_bytes = 0usize;
     let mut buf = [0u8; 4096];
     let start = Instant::now();
     let mut last_data = Instant::now();
@@ -182,13 +202,13 @@ pub fn run_capture(
             break (StopReason::Timeout, matched, false);
         }
 
-        let has_content = !lines.is_empty() || decoder.pending().is_some_and(|p| !p.is_empty());
+        let has_content = !lines.is_empty() || pending_tail(decoder, &runner).is_some();
         if !matched && has_content && last_data.elapsed() >= opts.idle {
             break (StopReason::Idle, false, false);
         }
 
-        match source.read(&mut buf) {
-            Ok(0) => {
+        match source.read_tagged(&mut buf) {
+            Ok((0, _)) => {
                 if source.finished() {
                     break (StopReason::Finished, matched, false);
                 }
@@ -197,13 +217,21 @@ pub fn run_capture(
                     std::thread::sleep(nap);
                 }
             }
-            Ok(n) => {
+            Ok((n, stream)) => {
                 last_data = Instant::now();
                 raw_bytes += n;
+                let active: &mut dyn Decode = match stream {
+                    Stream::Firmware => {
+                        firmware_bytes += n;
+                        &mut *decoder
+                    }
+                    Stream::Runner => &mut runner,
+                };
 
-                let new_lines = decoder.push(&buf[..n]);
+                let new_lines = active.push(&buf[..n]);
                 let had_new_lines = !new_lines.is_empty();
-                for line in new_lines {
+                for mut line in new_lines {
+                    line.runner = stream == Stream::Runner;
                     let is_match = !matched
                         && (stop.is_some_and(|re| re.is_match(&line.text))
                             || matches!((opts.stop_on_level, line.level),
@@ -218,7 +246,7 @@ pub fn run_capture(
 
                 if !matched {
                     // The match may land on the not-yet-terminated tail.
-                    if let Some(p) = decoder.pending()
+                    if let Some(p) = active.pending()
                         && stop.is_some_and(|re| re.is_match(p))
                     {
                         matched = true;
@@ -236,11 +264,11 @@ pub fn run_capture(
             }
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {}
             Err(e) => {
-                let empty = lines.is_empty() && decoder.pending().is_none_or(|p| p.is_empty());
-                if empty {
+                let tail = pending_tail(decoder, &runner);
+                if lines.is_empty() && tail.is_none() {
                     return Err(format!("Source read error: {e}"));
                 }
-                if let Some(tail) = decoder.pending().filter(|p| !p.is_empty()) {
+                if let Some(tail) = tail {
                     lines.push(Line::text(tail));
                 }
                 lines.push(Line::text(format!("Source read error: {e}")));
@@ -252,12 +280,13 @@ pub fn run_capture(
     let pending = if outcome.0 == StopReason::ReadError {
         String::new() // The unterminated tail was emitted before the diagnostic.
     } else {
-        decoder.pending().unwrap_or("").to_string()
+        pending_tail(decoder, &runner).unwrap_or_default()
     };
     Ok(CaptureResult {
         lines,
         pending,
         raw_bytes,
+        firmware_bytes,
         stop_reason: outcome.0,
         matched: outcome.1,
         truncated: outcome.2,
@@ -417,6 +446,62 @@ mod finite_source_tests {
         assert_eq!(r.stop_reason, StopReason::Matched);
         assert!(r.matched);
         assert!(raw_text(&r).contains("1 passed; 0 failed"));
+    }
+    /// Replays chunks tagged with their stream, as the semihosting source does
+    /// when it reads RTT alongside.
+    struct Tagged {
+        chunks: std::collections::VecDeque<(Stream, Vec<u8>)>,
+    }
+    impl ByteSource for Tagged {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.read_tagged(buf).map(|(n, _)| n)
+        }
+        fn read_tagged(&mut self, buf: &mut [u8]) -> std::io::Result<(usize, Stream)> {
+            let Some((stream, bytes)) = self.chunks.pop_front() else {
+                return Ok((0, Stream::Runner));
+            };
+            buf[..bytes.len()].copy_from_slice(&bytes);
+            Ok((bytes.len(), stream))
+        }
+        fn finished(&self) -> bool {
+            self.chunks.is_empty()
+        }
+    }
+    #[test]
+    fn runner_text_never_joins_a_partial_firmware_line() {
+        let mut source = Tagged {
+            chunks: [
+                (Stream::Firmware, b"log line\npartial ".to_vec()),
+                (Stream::Runner, b"test a ... ok\n".to_vec()),
+                (Stream::Firmware, b"rest\n".to_vec()),
+            ]
+            .into(),
+        };
+        let opts = CaptureOpts {
+            timeout: Duration::from_secs(1),
+            idle: Duration::from_secs(1),
+            stop: None,
+            stop_on_level: None,
+            flush: false,
+            max_bytes: 4096,
+            send: None,
+        };
+        let r = run_capture(&mut source, &mut TextDecoder::new(), &opts).unwrap();
+        let lines: Vec<(&str, bool)> = r
+            .lines
+            .iter()
+            .map(|l| (l.text.as_str(), l.runner))
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                ("log line", false),
+                ("test a ... ok", true),
+                ("partial rest", false),
+            ]
+        );
+        assert_eq!(r.raw_bytes, 36);
+        assert_eq!(r.firmware_bytes, 22);
     }
     #[test]
     fn finite_source_still_obeys_cap() {

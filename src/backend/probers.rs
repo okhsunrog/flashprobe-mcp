@@ -5,6 +5,8 @@
 //! the dep tree is large, so an espflash-only build can drop it with
 //! `--no-default-features`.
 
+use super::semihosting::SemihostingSource;
+use super::stacktrace::StackTracer;
 use crate::capture::ByteSource;
 use probe_rs::config::MemoryRegion;
 use probe_rs::flashing::{
@@ -14,7 +16,8 @@ use probe_rs::flashing::{
 use probe_rs::probe::DebugProbeInfo;
 use probe_rs::probe::list::Lister;
 use probe_rs::rtt::{ChannelMode, Rtt, ScanRegion};
-use probe_rs::{MemoryInterface, Permissions, Session};
+use probe_rs::semihosting::SemihostingCommand;
+use probe_rs::{BreakpointCause, CoreStatus, HaltReason, MemoryInterface, Permissions, Session};
 use std::time::{Duration, Instant};
 
 /// Default RTT up-channel to read (channel 0 is the conventional terminal).
@@ -167,6 +170,47 @@ pub fn verify_flash(session: &mut Session, path: &str, chip: &str) -> Result<boo
     }
 }
 
+/// Why RTT never came up, when the core's state says so.
+///
+/// A timeout alone cannot tell a firmware that is slow to initialize RTT from
+/// one that will never get there. A core that is halted settles it, and the
+/// halt reason usually names the fix, so a caller need not guess.
+fn halted_diagnosis(session: &mut Session) -> Option<String> {
+    let status = session.core(0).ok()?.status().ok()?;
+    let command = match status {
+        CoreStatus::Halted(HaltReason::Breakpoint(BreakpointCause::Semihosting(command))) => {
+            command
+        }
+        CoreStatus::Halted(reason) => {
+            return Some(format!(
+                "The core is halted ({reason:?}), so the firmware stopped before it initialized RTT."
+            ));
+        }
+        CoreStatus::LockedUp => {
+            return Some("The core is locked up, so the firmware never got to RTT.".into());
+        }
+        _ => return None,
+    };
+    Some(match command {
+        SemihostingCommand::GetCommandLine(_) => {
+            "The core is halted at a semihosting SYS_GET_CMDLINE request: the firmware is \
+             waiting for a host runner to tell it what to run. That is how an embedded-test \
+             binary starts, before `#[init]` sets up RTT. Run it with transport \"semihosting\", \
+             which is what \"auto\" picks for an ELF with an `.embedded_test` section; its RTT \
+             log is read alongside."
+                .into()
+        }
+        SemihostingCommand::ExitSuccess | SemihostingCommand::ExitError(_) => {
+            "The core is halted at a semihosting exit: the firmware finished before it \
+             initialized RTT. Run it with transport \"semihosting\" to see its exit status."
+                .into()
+        }
+        _ => "The core is halted at a semihosting request and is waiting for a host to \
+              answer it. Run it with transport \"semihosting\"."
+            .into(),
+    })
+}
+
 /// Download then reset-and-run so the firmware executes (no monitoring).
 pub fn flash(session: &mut Session, path: &str, chip: &str) -> Result<String, String> {
     let summary = download(session, path, chip)?;
@@ -244,6 +288,12 @@ pub fn reset_and_attach_rtt(
             Some(rtt) => break rtt,
             None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
             None => {
+                if let Some(cause) = halted_diagnosis(&mut session) {
+                    return Err(format!(
+                        "RTT control block did not appear within {:.1}s after reset. {cause}",
+                        attach_timeout.as_secs_f32()
+                    ));
+                }
                 // Say which of the two failure shapes this is: a firmware that
                 // never initializes RTT looks the same as one that simply took
                 // longer to get there, and the fix is different for each.
@@ -296,6 +346,7 @@ pub fn reset_and_attach_rtt(
         rtt,
         channel: RTT_UP_CHANNEL,
         restore_mode: Some(restore_mode),
+        tracer: elf_path.map(StackTracer::new),
     })
 }
 
@@ -394,6 +445,8 @@ pub struct RttSource {
     channel: usize,
     /// Mode to restore after a temporary host-side override.
     restore_mode: Option<ChannelMode>,
+    /// Present when the ELF is known, which unwinding needs.
+    tracer: Option<StackTracer>,
 }
 
 impl RttSource {
@@ -427,9 +480,11 @@ impl RttSource {
                 Ok(rtt) => break rtt,
                 Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
                 Err(e) => {
+                    let cause = halted_diagnosis(&mut session).unwrap_or_else(|| {
+                        "Is the firmware running and built with an RTT transport?".into()
+                    });
                     return Err(format!(
-                        "Failed to attach RTT within {:.1}s (is the firmware running and \
-                         built with an RTT transport?): {e}",
+                        "Failed to attach RTT within {:.1}s: {e}. {cause}",
                         attach_timeout.as_secs_f32()
                     ));
                 }
@@ -440,6 +495,7 @@ impl RttSource {
             rtt,
             channel: RTT_UP_CHANNEL,
             restore_mode: None,
+            tracer: elf_path.map(StackTracer::new),
         })
     }
 
@@ -507,6 +563,11 @@ impl ByteSource for RttSource {
 
     fn idle_nap(&self) -> Duration {
         Duration::from_millis(10)
+    }
+
+    fn stack_trace(&mut self) -> Option<Result<String, String>> {
+        let tracer = self.tracer.as_mut()?;
+        Some(tracer.trace_session(&mut self.session))
     }
 }
 
@@ -604,59 +665,89 @@ mod tests {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaptureTransport {
     Rtt,
-    Semihosting,
+    /// Semihosting. `rtt`: the ELF defines `_SEGGER_RTT`, so the firmware's
+    /// RTT log is read alongside.
+    Semihosting {
+        rtt: bool,
+    },
+}
+
+/// How a capture transport attaches.
+pub struct AttachOpts<'a> {
+    pub elf: Option<&'a str>,
+    /// How long RTT may take to come up (RTT transport only).
+    pub rtt_timeout: Duration,
+    /// Reset first, so the capture starts at the beginning of the run.
+    pub reset: bool,
+    /// Check that the flash holds `elf` before running an embedded-test suite.
+    /// `false` right after flashing that same file, when it could only pass.
+    pub verify_flash: bool,
+    /// Unwind the stack for each failed embedded-test case.
+    pub trace_failures: bool,
 }
 
 impl CaptureTransport {
     pub fn select(value: Option<&str>, elf: Option<&str>) -> Result<Self, String> {
-        match value.unwrap_or("auto") {
-            "rtt" => Ok(Self::Rtt),
-            "semihosting" => Ok(Self::Semihosting),
-            "auto" => {
-                // Without an ELF retain the existing RTT RAM scan behavior.
-                let Some(path) = elf else {
-                    return Ok(Self::Rtt);
-                };
-                let data =
-                    std::fs::read(path).map_err(|e| format!("Cannot read ELF '{path}': {e}"))?;
-                let addr = probe_rs::rtt::find_rtt_control_block_in_raw_file(&data)
-                    .map_err(|e| format!("Cannot inspect ELF '{path}': {e}"))?;
-                Ok(if addr.is_some() {
-                    Self::Rtt
-                } else {
-                    Self::Semihosting
-                })
-            }
-            other => Err(format!(
-                "Unknown transport '{other}'; use auto, rtt, or semihosting"
+        let value = value.unwrap_or("auto");
+        if !matches!(value, "auto" | "rtt" | "semihosting") {
+            return Err(format!(
+                "Unknown transport '{value}'; use auto, rtt, or semihosting"
+            ));
+        }
+        // Without an ELF, auto keeps the RTT RAM scan and an override is taken as given.
+        let Some(path) = elf else {
+            return Ok(if value == "semihosting" {
+                Self::Semihosting { rtt: false }
+            } else {
+                Self::Rtt
+            });
+        };
+        let data = std::fs::read(path).map_err(|e| format!("Cannot read ELF '{path}': {e}"))?;
+        let inspect = |e: &dyn std::fmt::Display| format!("Cannot inspect ELF '{path}': {e}");
+        // An embedded-test binary halts at its first semihosting request, before
+        // `#[init]` sets up any logging, and waits there for a runner. Only the
+        // semihosting transport runs it; its RTT log is read alongside.
+        let embedded_test = super::semihosting::is_embedded_test(&data).map_err(|e| inspect(&e))?;
+        let rtt = probe_rs::rtt::find_rtt_control_block_in_raw_file(&data)
+            .map_err(|e| inspect(&e))?
+            .is_some();
+        match value {
+            "rtt" if embedded_test => Err(format!(
+                "transport=\"rtt\" cannot run '{path}': it is an embedded-test binary, which \
+                 stops at a semihosting request before `#[init]` and waits for a test runner, \
+                 so RTT never comes up. Use transport \"auto\" or \"semihosting\": that runs \
+                 the suite and reads its RTT log alongside."
             )),
+            "rtt" => Ok(Self::Rtt),
+            "semihosting" => Ok(Self::Semihosting { rtt }),
+            _ if embedded_test || !rtt => Ok(Self::Semihosting { rtt }),
+            _ => Ok(Self::Rtt),
         }
     }
     pub fn label(self) -> &'static str {
         match self {
             Self::Rtt => "RTT",
-            Self::Semihosting => "semihosting",
+            Self::Semihosting { rtt: false } => "semihosting",
+            Self::Semihosting { rtt: true } => "semihosting + RTT",
         }
     }
-    /// `verify_flash` asks a semihosting embedded-test capture to check that
-    /// the flash matches `elf` before running anything; pass `false` right
-    /// after flashing that same file, when the check could only pass.
-    pub fn attach(
-        self,
-        session: Session,
-        elf: Option<&str>,
-        timeout: Duration,
-        reset: bool,
-        verify_flash: bool,
-    ) -> Result<Box<dyn ByteSource>, String> {
+    pub fn attach(self, session: Session, opts: AttachOpts) -> Result<Box<dyn ByteSource>, String> {
+        let AttachOpts {
+            elf,
+            rtt_timeout,
+            reset,
+            verify_flash,
+            trace_failures,
+        } = opts;
         match self {
-            Self::Rtt if reset => Ok(Box::new(reset_and_attach_rtt(session, elf, timeout)?)),
-            Self::Rtt => Ok(Box::new(RttSource::attach(session, elf, timeout)?)),
-            Self::Semihosting => Ok(Box::new(super::semihosting::SemihostingSource::attach(
+            Self::Rtt if reset => Ok(Box::new(reset_and_attach_rtt(session, elf, rtt_timeout)?)),
+            Self::Rtt => Ok(Box::new(RttSource::attach(session, elf, rtt_timeout)?)),
+            Self::Semihosting { .. } => Ok(Box::new(SemihostingSource::attach(
                 session,
                 elf,
                 reset,
                 verify_flash,
+                trace_failures,
             )?)),
         }
     }
@@ -688,7 +779,7 @@ mod transport_tests {
         std::fs::write(path, elf.write().unwrap()).unwrap();
         assert_eq!(
             CaptureTransport::select(None, Some(path)).unwrap(),
-            CaptureTransport::Semihosting
+            CaptureTransport::Semihosting { rtt: false }
         );
         assert_eq!(
             CaptureTransport::select(Some("rtt"), Some(path)).unwrap(),
@@ -711,8 +802,25 @@ mod transport_tests {
         );
         assert_eq!(
             CaptureTransport::select(Some("semihosting"), Some(path)).unwrap(),
-            CaptureTransport::Semihosting
+            CaptureTransport::Semihosting { rtt: true }
         );
+
+        // An embedded-test ELF that also logs over RTT: the suite needs the
+        // semihosting runner, and forcing RTT is refused with the reason.
+        let tests = elf.add_section(
+            vec![],
+            b".embedded_test".to_vec(),
+            SectionKind::ReadOnlyData,
+        );
+        elf.append_section_data(tests, &1u32.to_le_bytes(), 4);
+        std::fs::write(path, elf.write().unwrap()).unwrap();
+        assert_eq!(
+            CaptureTransport::select(None, Some(path)).unwrap(),
+            CaptureTransport::Semihosting { rtt: true }
+        );
+        let err = CaptureTransport::select(Some("rtt"), Some(path)).unwrap_err();
+        assert!(err.contains("embedded-test"), "{err}");
+
         std::fs::write(path, b"invalid ELF").unwrap();
         assert!(CaptureTransport::select(None, Some(path)).is_err());
         assert!(CaptureTransport::select(Some("typo"), None).is_err());

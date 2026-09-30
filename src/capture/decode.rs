@@ -80,6 +80,10 @@ pub struct Line {
     pub text: String,
     pub level: Option<Level>,
     pub module: Option<String>,
+    /// Came from [`Stream::Runner`](crate::capture::Stream::Runner): a test
+    /// verdict or stack trace. The level and module filters select firmware
+    /// logs, so they keep these lines rather than hiding the results.
+    pub runner: bool,
 }
 
 impl Line {
@@ -89,6 +93,7 @@ impl Line {
             text: text.into(),
             level: None,
             module: None,
+            runner: false,
         }
     }
 }
@@ -398,6 +403,7 @@ fn line_from_frame(
         text,
         level,
         module,
+        runner: false,
     }
 }
 

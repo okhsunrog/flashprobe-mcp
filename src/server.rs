@@ -66,6 +66,16 @@ impl ServerHandler for Server {
                  timeout, or byte cap. Provide an ELF (or let it auto-detect) to decode \
                  defmt — then `level`/`module` filter structurally and a suppressed \
                  count reports what was hidden. Text mode strips boot noise + ANSI.\n\n\
+                 ## embedded-test\n\
+                 A test ELF (`.embedded_test` section) runs as a suite with probe-rs: \
+                 flash_monitor with the ELF from `cargo test --no-run`, no other \
+                 settings needed. Each test's RTT log precedes its `test NAME ... ok` / \
+                 `FAILED (reason)` line, a failed test gets a stack trace, and the call \
+                 returns on `test result:` (timeout defaults to the suite's own).\n\n\
+                 ## Panics\n\
+                 probe-rs captures that show `panicked at` end with a stack trace of \
+                 the firmware, as `probe-rs run --always-print-stacktrace` prints it \
+                 (`stacktrace` overrides).\n\n\
                  ## Sending to the target\n\
                  monitor / flash_monitor / rerun take `send`: a string written to the \
                  device before reading (probe-rs: RTT down-channel 0; espflash: serial \

@@ -41,7 +41,7 @@ use crate::backend::probers;
 #[tool_router(router = capture_router, vis = "pub(crate)")]
 impl Server {
     #[tool(
-        description = "Read output from a device for a bounded window. An embedded-test ELF runs a fresh suite (resets before each test) after verifying that the flash holds that exact build - a rebuilt ELF that was not flashed is an error, use flash_monitor; ordinary firmware attaches without reset. Backend (REQUIRED): \"probe-rs\" (RTT/semihosting) or \"espflash\" (UART). The ELF auto-detects from the project for defmt decode (structured level/module; or pass `elf`); else plain text. Stops on: regex `stop`, `stop_on_level` (defmt), idle_ms, max timeout, or byte cap. Text mode strips boot noise + ANSI and focuses on the `stop` match. To drive a firmware command interface, set `send` (e.g. \"status\\n\"): it is written to the target after the flush and before reading, so the reply lands in this capture - pair it with `stop` to return the moment the answer arrives."
+        description = "Read output from a device for a bounded window. An embedded-test ELF runs a fresh suite (resets before each test, RTT log read alongside, stack trace per failed test) after verifying that the flash holds that exact build - a rebuilt ELF that was not flashed is an error, use flash_monitor; ordinary firmware attaches without reset. Backend (REQUIRED): \"probe-rs\" (RTT/semihosting) or \"espflash\" (UART). The ELF auto-detects from the project for defmt decode (structured level/module; or pass `elf`); else plain text. Stops on: regex `stop`, `stop_on_level` (defmt), idle_ms, max timeout, or byte cap. Text mode strips boot noise + ANSI and focuses on the `stop` match. To drive a firmware command interface, set `send` (e.g. \"status\\n\"): it is written to the target after the flush and before reading, so the reply lands in this capture - pair it with `stop` to return the moment the answer arrives."
     )]
     async fn monitor(
         &self,
@@ -52,16 +52,9 @@ impl Server {
             let grep_re = compile_opt_regex(input.grep.as_deref())?;
             let module_re = compile_opt_regex(input.module.as_deref())?;
             let min_level = parse_level_opt(input.level.as_deref())?;
-            let opts = CaptureOpts {
-                timeout: Duration::from_secs_f64(input.timeout_s),
-                idle: Duration::from_millis(input.idle_ms),
-                stop: stop_re.clone(),
-                stop_on_level: parse_level_opt(input.stop_on_level.as_deref())?,
-                flush: input.flush,
-                max_bytes: input.max_bytes,
-                // Parsed up front so a bad escape fails before we touch hardware.
-                send: input.send.as_deref().map(parse_escapes).transpose()?,
-            };
+            let stop_on_level = parse_level_opt(input.stop_on_level.as_deref())?;
+            // Parsed up front so a bad escape fails before we touch hardware.
+            let send = input.send.as_deref().map(parse_escapes).transpose()?;
             let mut det = Detector::new(input.project_dir.as_deref(), input.bin.as_deref());
 
             // ELF is needed both for defmt decode AND (probe-rs) to pin the RTT
@@ -90,10 +83,13 @@ impl Server {
                         (
                             transport.attach(
                                 session,
-                                elf.as_deref(),
-                                rtt_attach_timeout(input.rtt_attach_timeout_ms),
-                                false,
-                                true,
+                                probers::AttachOpts {
+                                    elf: elf.as_deref(),
+                                    rtt_timeout: rtt_attach_timeout(input.rtt_attach_timeout_ms),
+                                    reset: false,
+                                    verify_flash: true,
+                                    trace_failures: input.stacktrace != Some(false),
+                                },
                             )?,
                             format!("Probe: {chip} via {}", transport.label()),
                             DefmtFraming::Raw,
@@ -106,10 +102,25 @@ impl Server {
                 load_optional_table(elf.as_deref(), input.decode.as_deref())?
             };
             let mode = decode_mode(&defmt, framing);
+            let (timeout, idle) = bounds(input.timeout_s, input.idle_ms, source.as_ref());
+            let opts = CaptureOpts {
+                timeout,
+                idle,
+                stop: stop_re.clone(),
+                stop_on_level,
+                flush: input.flush,
+                max_bytes: input.max_bytes,
+                send,
+            };
             send_delay(opts.send.as_ref(), input.send_delay_ms);
             let (result, stats) = capture(source.as_mut(), &mode, &opts)?;
+            let trace = stack_trace_section(source.as_mut(), &result, input.stacktrace);
 
-            let header = format!("{header}{}", send_note(opts.send.as_ref()));
+            let header = format!(
+                "{header}{}{}",
+                send_note(opts.send.as_ref()),
+                source_note(source.as_ref())
+            );
             let block = render_block(
                 &header,
                 &result,
@@ -126,7 +137,7 @@ impl Server {
                     module_re.as_ref(),
                 ),
             );
-            Ok(format!("## Serial Monitor Output\n\n{block}"))
+            Ok(format!("## Serial Monitor Output\n\n{block}{trace}"))
         })
         .await
         .map_err(|e| McpError::internal_error(e.to_string(), None))?
@@ -136,7 +147,7 @@ impl Server {
     }
 
     #[tool(
-        description = "Flash firmware, then immediately capture output to verify the boot. Backend (REQUIRED): \"probe-rs\" (flash + RTT/semihosting) or \"espflash\" (flash + UART). File/chip auto-detect from the project; the flashed ELF is the defmt source. Captures from boot. Stops on: regex `stop`, `stop_on_level` (defmt), idle_ms, max timeout, or byte cap. `send` writes a command to the target before reading; on a just-flashed device pair it with `send_delay_ms` so the firmware is up first."
+        description = "Flash firmware, then immediately capture output to verify the boot. Backend (REQUIRED): \"probe-rs\" (flash + RTT/semihosting) or \"espflash\" (flash + UART). File/chip auto-detect from the project; the flashed ELF is the defmt source. Captures from boot. An embedded-test ELF (from `cargo test --no-run`) runs as a suite with probe-rs: each test's RTT/defmt log precedes its `test NAME ... ok/FAILED` line, failed tests get a stack trace, and the call returns on `test result:` with no bounds to set. Stops on: regex `stop`, `stop_on_level` (defmt), idle_ms, max timeout, or byte cap. With probe-rs, output showing `panicked at` ends with a stack trace. `send` writes a command to the target before reading; on a just-flashed device pair it with `send_delay_ms` so the firmware is up first."
     )]
     async fn flash_monitor(
         &self,
@@ -147,15 +158,8 @@ impl Server {
             let grep_re = compile_opt_regex(input.grep.as_deref())?;
             let module_re = compile_opt_regex(input.module.as_deref())?;
             let min_level = parse_level_opt(input.level.as_deref())?;
-            let opts = CaptureOpts {
-                timeout: Duration::from_secs_f64(input.timeout_s),
-                idle: Duration::from_millis(input.idle_ms),
-                stop: stop_re.clone(),
-                stop_on_level: parse_level_opt(input.stop_on_level.as_deref())?,
-                flush: false, // do not flush: we want the boot output
-                max_bytes: input.max_bytes,
-                send: input.send.as_deref().map(parse_escapes).transpose()?,
-            };
+            let stop_on_level = parse_level_opt(input.stop_on_level.as_deref())?;
+            let send = input.send.as_deref().map(parse_escapes).transpose()?;
             let mut det = Detector::new(input.project_dir.as_deref(), input.bin.as_deref());
             // The file to flash: explicit, else the detected build artifact.
             let file_path = det.elf(input.file_path.as_deref())?;
@@ -202,10 +206,14 @@ impl Server {
                     // Reset + attach the selected transport so capture starts at the run's beginning.
                     let src = transport.attach(
                         session,
-                        Some(&file_path),
-                        rtt_attach_timeout(input.rtt_attach_timeout_ms),
-                        true,
-                        false,
+                        probers::AttachOpts {
+                            elf: Some(&file_path),
+                            rtt_timeout: rtt_attach_timeout(input.rtt_attach_timeout_ms),
+                            reset: true,
+                            // Just flashed from this very file.
+                            verify_flash: false,
+                            trace_failures: input.stacktrace != Some(false),
+                        },
                     )?;
                     (
                         msg,
@@ -227,10 +235,25 @@ impl Server {
                 load_optional_table(elf_path.as_deref(), input.decode.as_deref())?
             };
             let mode = decode_mode(&defmt, framing);
+            let (timeout, idle) = bounds(input.timeout_s, input.idle_ms, source.as_ref());
+            let opts = CaptureOpts {
+                timeout,
+                idle,
+                stop: stop_re.clone(),
+                stop_on_level,
+                flush: false, // do not flush: we want the boot output
+                max_bytes: input.max_bytes,
+                send,
+            };
             send_delay(opts.send.as_ref(), input.send_delay_ms);
             let (result, stats) = capture(source.as_mut(), &mode, &opts)?;
+            let trace = stack_trace_section(source.as_mut(), &result, input.stacktrace);
 
-            let header = format!("{header}{}", send_note(opts.send.as_ref()));
+            let header = format!(
+                "{header}{}{}",
+                send_note(opts.send.as_ref()),
+                source_note(source.as_ref())
+            );
             let block = render_block(
                 &header,
                 &result,
@@ -248,7 +271,7 @@ impl Server {
                 ),
             );
             Ok(format!(
-                "## Flash + Monitor\n\n{flash_msg}\n\n### Serial Output\n\n{block}"
+                "## Flash + Monitor\n\n{flash_msg}\n\n### Serial Output\n\n{block}{trace}"
             ))
         })
         .await
@@ -300,35 +323,15 @@ impl Server {
                 }
             };
 
-            let defmt = match &conn {
-                #[cfg(feature = "probe-rs")]
-                Conn::Jtag(_, probers::CaptureTransport::Semihosting) => None,
-                _ => load_optional_table(elf.as_deref(), input.decode.as_deref())?,
-            };
+            // A semihosting-only source is text whatever the ELF holds; `capture`
+            // sees that from the source and ignores the table.
+            let defmt = load_optional_table(elf.as_deref(), input.decode.as_deref())?;
             // Parsed once; every cycle re-sends it after its own reset.
             let send = input.send.as_deref().map(parse_escapes).transpose()?;
 
-            // One reset + capture on the selected backend / decode mode.
-            let one_cycle = || -> Result<(CaptureResult, Option<DefmtStats>), String> {
-                let opts = CaptureOpts {
-                    timeout: Duration::from_secs_f64(input.timeout_s),
-                    idle: Duration::from_millis(input.idle_ms),
-                    stop: stop_re.clone(),
-                    stop_on_level,
-                    // Never flush here. Every cycle has just reset the target,
-                    // so everything buffered is this boot's output — which is
-                    // exactly what the caller asked to see. Discarding it loses
-                    // the early frames, or the whole log for a target that
-                    // prints once and goes quiet.
-                    //
-                    // This holds for both backends. On RTT the reset-and-attach
-                    // already invalidated the old control block; on serial the
-                    // port is opened after the reset, so there is no stale
-                    // input left to clean up either.
-                    flush: false,
-                    max_bytes: input.max_bytes,
-                    send: send.clone(),
-                };
+            // One reset + capture on the selected backend / decode mode, with
+            // any stack trace section and source note for it.
+            let one_cycle = |stacktrace: Option<bool>| -> Result<Cycle, String> {
                 let mode = decode_mode(&defmt, framing);
                 let mut source: Box<dyn ByteSource> = match &conn {
                     Conn::Serial(port) => {
@@ -348,23 +351,57 @@ impl Server {
                         // Reset + attach the selected transport so each cycle captures from the start.
                         transport.attach(
                             session,
-                            elf.as_deref(),
-                            rtt_attach_timeout(input.rtt_attach_timeout_ms),
-                            true,
-                            true,
+                            probers::AttachOpts {
+                                elf: elf.as_deref(),
+                                rtt_timeout: rtt_attach_timeout(input.rtt_attach_timeout_ms),
+                                reset: true,
+                                verify_flash: true,
+                                trace_failures: stacktrace != Some(false),
+                            },
                         )?
                     }
                 };
+                let (timeout, idle) = bounds(input.timeout_s, input.idle_ms, source.as_ref());
+                let opts = CaptureOpts {
+                    timeout,
+                    idle,
+                    stop: stop_re.clone(),
+                    stop_on_level,
+                    // Never flush here. Every cycle has just reset the target,
+                    // so everything buffered is this boot's output — which is
+                    // exactly what the caller asked to see. Discarding it loses
+                    // the early frames, or the whole log for a target that
+                    // prints once and goes quiet.
+                    //
+                    // This holds for both backends. On RTT the reset-and-attach
+                    // already invalidated the old control block; on serial the
+                    // port is opened after the reset, so there is no stale
+                    // input left to clean up either.
+                    flush: false,
+                    max_bytes: input.max_bytes,
+                    send: send.clone(),
+                };
                 send_delay(opts.send.as_ref(), input.send_delay_ms);
-                capture(source.as_mut(), &mode, &opts)
+                let (result, stats) = capture(source.as_mut(), &mode, &opts)?;
+                Ok(Cycle {
+                    trace: stack_trace_section(source.as_mut(), &result, stacktrace),
+                    note: source_note(source.as_ref()),
+                    result,
+                    stats,
+                })
             };
 
             let header = format!("{header}{}", send_note(send.as_ref()));
 
             if repeat == 1 {
-                let (result, stats) = one_cycle()?;
+                let Cycle {
+                    result,
+                    stats,
+                    trace,
+                    note,
+                } = one_cycle(input.stacktrace)?;
                 let block = render_block(
-                    &header,
+                    &format!("{header}{note}"),
                     &result,
                     stats,
                     &render_opts(
@@ -379,14 +416,16 @@ impl Server {
                         module_re.as_ref(),
                     ),
                 );
-                return Ok(format!("## Rerun (reset + monitor)\n\n{block}"));
+                return Ok(format!("## Rerun (reset + monitor)\n\n{block}{trace}"));
             }
 
-            // repeat > 1: compact summary, one line per run.
+            // repeat > 1: compact summary, one line per run, so no stack traces.
             let mut matched_count = 0usize;
             let mut rows = String::new();
             for i in 1..=repeat {
-                let (mr, stats) = one_cycle()?;
+                let Cycle {
+                    result: mr, stats, ..
+                } = one_cycle(Some(false))?;
                 if mr.matched {
                     matched_count += 1;
                 }
@@ -426,6 +465,71 @@ impl Server {
 /// Parse an optional level name (`info`, `error`, …).
 fn parse_level_opt(s: Option<&str>) -> Result<Option<Level>, String> {
     s.map(Level::parse).transpose()
+}
+
+/// One `rerun` cycle: the capture plus what goes around its rendered block.
+struct Cycle {
+    result: CaptureResult,
+    stats: Option<DefmtStats>,
+    trace: String,
+    note: String,
+}
+
+/// The capture's timeout and idle bound: what the caller set, else the defaults.
+///
+/// A test suite is the exception. Its runner already bounds every test with
+/// the test's own timeout and ends by itself, so an unset timeout becomes the
+/// suite's whole budget and an unset idle bound is dropped: the 5 s default
+/// would cut a suite off halfway, and a test may stay quiet for most of its
+/// timeout without anything being wrong.
+fn bounds(
+    timeout_s: Option<f64>,
+    idle_ms: Option<u64>,
+    source: &dyn ByteSource,
+) -> (Duration, Duration) {
+    let budget = source.run_budget();
+    let timeout = timeout_s
+        .map(Duration::from_secs_f64)
+        .or(budget)
+        .unwrap_or_else(|| Duration::from_secs_f64(default_timeout_secs()));
+    let idle = idle_ms.map(Duration::from_millis).unwrap_or(match budget {
+        Some(_) => Duration::MAX,
+        None => Duration::from_millis(default_idle_ms()),
+    });
+    (timeout, idle)
+}
+
+/// Whether the capture shows a Rust panic. Every panic handler prints the
+/// standard `panicked at` message, over whichever transport it uses.
+fn shows_panic(result: &CaptureResult) -> bool {
+    const MARKER: &str = "panicked at";
+    result.lines.iter().any(|l| l.text.contains(MARKER)) || result.pending.contains(MARKER)
+}
+
+/// A stack trace of the firmware after the capture, rendered as its own
+/// section. `stacktrace` is the tool argument: unset traces only a capture
+/// that shows a panic, since that is when the frames say where it happened.
+fn stack_trace_section(
+    source: &mut dyn ByteSource,
+    result: &CaptureResult,
+    stacktrace: Option<bool>,
+) -> String {
+    if !stacktrace.unwrap_or_else(|| shows_panic(result)) {
+        return String::new();
+    }
+    match source.stack_trace() {
+        None => String::new(),
+        Some(Ok(trace)) => format!("\n\nStack trace when the capture ended:\n\n```\n{trace}```"),
+        Some(Err(e)) => format!("\n\nNo stack trace: {e}"),
+    }
+}
+
+/// Header suffix for what the source knows but the output cannot show.
+fn source_note(source: &dyn ByteSource) -> String {
+    source
+        .note()
+        .map(|n| format!("\nNote: {n}"))
+        .unwrap_or_default()
 }
 
 /// Interpret C-style escapes in a `send` payload.
@@ -600,7 +704,55 @@ fn run_summary(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_escapes;
+    use super::{bounds, parse_escapes, shows_panic};
+    use crate::capture::{ByteSource, CaptureResult, Line, StopReason};
+    use std::time::Duration;
+
+    struct Source(Option<Duration>);
+    impl ByteSource for Source {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Ok(0)
+        }
+        fn run_budget(&self) -> Option<Duration> {
+            self.0
+        }
+    }
+
+    #[test]
+    fn a_suite_is_bounded_by_its_own_budget_unless_told_otherwise() {
+        let suite = Source(Some(Duration::from_secs(65)));
+        assert_eq!(
+            bounds(None, None, &suite),
+            (Duration::from_secs(65), Duration::MAX)
+        );
+        assert_eq!(
+            bounds(Some(3.0), Some(500), &suite),
+            (Duration::from_secs(3), Duration::from_millis(500))
+        );
+        assert_eq!(
+            bounds(None, None, &Source(None)),
+            (Duration::from_secs(5), Duration::from_millis(4000))
+        );
+    }
+
+    #[test]
+    fn a_panic_is_recognized_in_complete_and_pending_lines() {
+        let capture = |lines: &[&str], pending: &str| CaptureResult {
+            lines: lines.iter().map(|l| Line::text(*l)).collect(),
+            pending: pending.into(),
+            raw_bytes: 0,
+            firmware_bytes: 0,
+            stop_reason: StopReason::Idle,
+            matched: false,
+            truncated: false,
+        };
+        assert!(shows_panic(&capture(
+            &["INFO tick", "ERROR panicked at 'boom'"],
+            ""
+        )));
+        assert!(shows_panic(&capture(&[], "panicked at src/main.rs:3:5")));
+        assert!(!shows_panic(&capture(&["INFO tick"], "")));
+    }
 
     #[test]
     fn escapes_decode_to_bytes() {

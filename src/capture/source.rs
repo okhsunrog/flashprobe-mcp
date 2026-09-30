@@ -5,13 +5,24 @@
 
 use std::time::Duration;
 
+/// Which decoder a chunk of bytes belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stream {
+    /// The firmware's log stream: RTT or serial, decoded as defmt or text.
+    Firmware,
+    /// Plain text the semihosting runner produces or relays: test verdicts,
+    /// stack traces, semihosting console writes. Never defmt.
+    Runner,
+}
+
 pub trait ByteSource {
     /// True once a finite source has completed and all buffered bytes were read.
     fn finished(&self) -> bool {
         false
     }
 
-    /// Semihosting console output is text even if the ELF also contains defmt.
+    /// True when everything arrives on [`Stream::Runner`], so a defmt table
+    /// in the ELF has nothing to decode: semihosting without RTT.
     fn text_only(&self) -> bool {
         false
     }
@@ -21,6 +32,32 @@ pub trait ByteSource {
     /// EOF, and paces itself with [`ByteSource::idle_nap`]). `Err` only on a real
     /// source failure.
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize>;
+
+    /// [`ByteSource::read`], saying which stream the bytes came from. A source
+    /// that carries two streams overrides this to keep them apart and in order.
+    fn read_tagged(&mut self, buf: &mut [u8]) -> std::io::Result<(usize, Stream)> {
+        self.read(buf).map(|n| (n, Stream::Firmware))
+    }
+
+    /// The longest a source that finishes by itself can legitimately run: a
+    /// test suite, whose runner already enforces a timeout per test. A capture
+    /// given no explicit bound waits this long and does not stop on idle, since
+    /// a test is free to stay quiet for most of its timeout.
+    fn run_budget(&self) -> Option<Duration> {
+        None
+    }
+
+    /// Something the caller should know about the capture that the output
+    /// cannot show, e.g. a log transport that never came up.
+    fn note(&self) -> Option<String> {
+        None
+    }
+
+    /// A stack trace of the firmware as it is now, for a capture that ended
+    /// in a panic. `None` when this source cannot produce one.
+    fn stack_trace(&mut self) -> Option<Result<String, String>> {
+        None
+    }
 
     /// Discard already-buffered input (the `flush` option). Default: no-op.
     fn flush_input(&mut self) -> std::io::Result<()> {

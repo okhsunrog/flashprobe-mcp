@@ -216,18 +216,18 @@ pub struct MonitorInput {
     /// espflash backend only.
     #[serde(default = "default_monitor_baud")]
     pub baud: u32,
-    /// Maximum time to monitor in seconds (default: 5)
-    #[serde(default = "default_timeout_secs")]
-    pub timeout_s: f64,
+    /// Maximum time to monitor in seconds (default: 5; an embedded-test suite
+    /// defaults to the sum of its per-test timeouts, and returns when it finishes)
+    pub timeout_s: Option<f64>,
     /// Stop capturing when this (unanchored) regex matches a rendered line. It is
     /// a substring regex, not anchored — `RESULT` matches mid-line. Plain text is
     /// a valid pattern. Alternation works: `RESULT (PASS|FAIL)`, `panic|abort`.
     pub stop: Option<String>,
     /// Stop after no new data is received for this many milliseconds (default:
-    /// 4000). Raise it (6000-10000) for programs that think for a while between
-    /// prints; lower it (1500-2000) for firmware that boots and prints immediately.
-    #[serde(default = "default_idle_ms")]
-    pub idle_ms: u64,
+    /// 4000; not applied to an embedded-test suite unless set). Raise it
+    /// (6000-10000) for programs that think for a while between prints; lower
+    /// it (1500-2000) for firmware that boots and prints immediately.
+    pub idle_ms: Option<u64>,
     /// Drop the ROM baud-mismatch garbage and ESP-IDF bootloader log lines that
     /// precede the application output (default: true). Set false to get raw bytes.
     #[serde(default = "default_true")]
@@ -285,9 +285,17 @@ pub struct MonitorInput {
     /// milliseconds (default: 1500). Raise it for a target whose bootloader runs
     /// for a while before the application starts.
     pub rtt_attach_timeout_ms: Option<u64>,
-    /// probe-rs capture transport: auto (default), rtt, or semihosting.
+    /// probe-rs capture transport: auto (default), rtt, or semihosting. Auto
+    /// runs an ELF with an `.embedded_test` section as a test suite over
+    /// semihosting, reading its RTT log alongside; otherwise it picks RTT when
+    /// the ELF defines `_SEGGER_RTT`, else semihosting.
     #[serde(default)]
     pub transport: Option<String>,
+    /// probe-rs stack traces, unwound with the ELF's debug info as `probe-rs
+    /// run` prints them. Default: for each failed embedded-test case, and at
+    /// the end of any other capture whose output shows `panicked at`. true:
+    /// also at the end of a capture that shows no panic. false: never.
+    pub stacktrace: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -320,15 +328,16 @@ pub struct FlashMonitorInput {
     pub partition_table: Option<String>,
     /// Path to a custom bootloader binary file
     pub bootloader: Option<String>,
-    /// Maximum time to monitor after flash in seconds (default: 5)
-    #[serde(default = "default_timeout_secs")]
-    pub timeout_s: f64,
+    /// Maximum time to monitor after flash in seconds (default: 5; an
+    /// embedded-test suite defaults to the sum of its per-test timeouts, and
+    /// returns when it finishes)
+    pub timeout_s: Option<f64>,
     /// Stop capturing when this (unanchored) regex matches a rendered line.
     /// Substring regex with alternation: `RESULT (PASS|FAIL)`, `panic|Guru Meditation`.
     pub stop: Option<String>,
-    /// Stop after no new data is received for this many milliseconds (default: 4000).
-    #[serde(default = "default_idle_ms")]
-    pub idle_ms: u64,
+    /// Stop after no new data is received for this many milliseconds (default:
+    /// 4000; not applied to an embedded-test suite unless set).
+    pub idle_ms: Option<u64>,
     /// Drop ROM garbage and ESP-IDF bootloader log lines before app output (default: true).
     #[serde(default = "default_true")]
     pub strip_boot_noise: bool,
@@ -373,9 +382,17 @@ pub struct FlashMonitorInput {
     /// milliseconds (default: 1500). Raise it for a target whose bootloader runs
     /// for a while before the application starts.
     pub rtt_attach_timeout_ms: Option<u64>,
-    /// probe-rs capture transport: auto (default), rtt, or semihosting.
+    /// probe-rs capture transport: auto (default), rtt, or semihosting. Auto
+    /// runs an ELF with an `.embedded_test` section as a test suite over
+    /// semihosting, reading its RTT log alongside; otherwise it picks RTT when
+    /// the ELF defines `_SEGGER_RTT`, else semihosting.
     #[serde(default)]
     pub transport: Option<String>,
+    /// probe-rs stack traces, unwound with the ELF's debug info as `probe-rs
+    /// run` prints them. Default: for each failed embedded-test case, and at
+    /// the end of any other capture whose output shows `panicked at`. true:
+    /// also at the end of a capture that shows no panic. false: never.
+    pub stacktrace: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -395,15 +412,16 @@ pub struct RerunInput {
     /// Baud rate for serial monitoring (default: 115200). espflash backend only.
     #[serde(default = "default_monitor_baud")]
     pub baud: u32,
-    /// Maximum time to monitor in seconds (default: 5)
-    #[serde(default = "default_timeout_secs")]
-    pub timeout_s: f64,
+    /// Maximum time to monitor in seconds, per run (default: 5; an embedded-test
+    /// suite defaults to the sum of its per-test timeouts, and returns when it
+    /// finishes)
+    pub timeout_s: Option<f64>,
     /// Stop capturing when this (unanchored) regex matches a rendered line.
     /// Substring regex with alternation: `RESULT (PASS|FAIL)`, `panic|Guru Meditation`.
     pub stop: Option<String>,
-    /// Stop after no new data is received for this many milliseconds (default: 4000).
-    #[serde(default = "default_idle_ms")]
-    pub idle_ms: u64,
+    /// Stop after no new data is received for this many milliseconds (default:
+    /// 4000; not applied to an embedded-test suite unless set).
+    pub idle_ms: Option<u64>,
     /// Drop ROM garbage and ESP-IDF bootloader log lines before app output (default: true).
     #[serde(default = "default_true")]
     pub strip_boot_noise: bool,
@@ -453,7 +471,15 @@ pub struct RerunInput {
     /// milliseconds (default: 1500). Raise it for a target whose bootloader runs
     /// for a while before the application starts.
     pub rtt_attach_timeout_ms: Option<u64>,
-    /// probe-rs capture transport: auto (default), rtt, or semihosting.
+    /// probe-rs capture transport: auto (default), rtt, or semihosting. Auto
+    /// runs an ELF with an `.embedded_test` section as a test suite over
+    /// semihosting, reading its RTT log alongside; otherwise it picks RTT when
+    /// the ELF defines `_SEGGER_RTT`, else semihosting.
     #[serde(default)]
     pub transport: Option<String>,
+    /// probe-rs stack traces, unwound with the ELF's debug info as `probe-rs
+    /// run` prints them. Default: for each failed embedded-test case, and at
+    /// the end of any other capture whose output shows `panicked at`. true:
+    /// also at the end of a capture that shows no panic. false: never.
+    pub stacktrace: Option<bool>,
 }

@@ -163,7 +163,9 @@ fn render_defmt(
             *hidden_by_level.entry(lv).or_default() += 1;
             continue;
         }
-        if let Some(mre) = opts.module {
+        if let Some(mre) = opts.module
+            && !l.runner
+        {
             // A module filter only keeps frames whose module is known and matches.
             if !l.module.as_deref().is_some_and(|m| mre.is_match(m)) {
                 continue;
@@ -202,7 +204,7 @@ fn render_defmt(
             .collect();
         header.push_str(&format!("\nhidden by level: {}", parts.join(", ")));
     }
-    if stats.decoded == 0 && result.raw_bytes > 0 {
+    if stats.decoded == 0 && result.firmware_bytes > 0 {
         header.push_str(
             "\n[warning: 0 defmt frames decoded from a non-empty stream \u{2014} the ELF likely \
              does not match the running firmware]",
@@ -271,6 +273,7 @@ mod tests {
             text: text.to_string(),
             level,
             module: module.map(String::from),
+            runner: false,
         }
     }
 
@@ -279,6 +282,7 @@ mod tests {
             lines,
             pending: String::new(),
             raw_bytes: 100,
+            firmware_bytes: 100,
             stop_reason: reason,
             matched,
             truncated: false,
@@ -381,6 +385,58 @@ mod tests {
         );
         assert!(out.contains("INFO 2") && out.contains("ERROR boom"));
         assert!(!out.contains("INFO 1") && !out.contains("after"));
+    }
+
+    /// A module filter selects firmware logs; the test verdicts from the runner
+    /// are what the caller is waiting for and must not vanish with it.
+    #[test]
+    fn defmt_filters_keep_runner_lines() {
+        let re = Regex::new("app::foo").unwrap();
+        let mut verdict = line("test a ... FAILED", None, None);
+        verdict.runner = true;
+        let r = result(
+            vec![
+                line("INFO a", Some(Level::Info), Some("app::foo")),
+                line("INFO b", Some(Level::Info), Some("app::bar")),
+                verdict,
+            ],
+            false,
+            StopReason::Finished,
+        );
+        let opts = defmt_opts(None, None, Some(Level::Info), Some(&re));
+        let out = render_block(
+            "Probe: x",
+            &r,
+            Some(DefmtStats {
+                decoded: 2,
+                malformed: 0,
+            }),
+            &opts,
+        );
+        assert!(out.contains("INFO a") && out.contains("test a ... FAILED"));
+        assert!(!out.contains("INFO b"));
+    }
+
+    /// Runner text is not defmt, so a suite whose RTT never came up must not be
+    /// reported as an ELF that does not match the firmware.
+    #[test]
+    fn runner_bytes_alone_do_not_suggest_an_elf_mismatch() {
+        let mut r = result(
+            vec![line("test a ... ok", None, None)],
+            false,
+            StopReason::Finished,
+        );
+        r.firmware_bytes = 0;
+        let out = render_block(
+            "Probe: x",
+            &r,
+            Some(DefmtStats {
+                decoded: 0,
+                malformed: 0,
+            }),
+            &defmt_opts(None, None, None, None),
+        );
+        assert!(!out.contains("does not match"), "{out}");
     }
 
     #[test]

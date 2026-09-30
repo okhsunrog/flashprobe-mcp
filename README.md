@@ -128,49 +128,82 @@ mechanism); only `list_ports` is serial-specific.
   `panic|abort`). Plain text is a valid pattern.
 - **`stop_on_level`** — defmt only: stop on the first frame at/above a level
   (e.g. `error`) — the "did it panic?" button.
-- **`idle_ms`** — no new data for this long (default `4000`).
-- **`timeout_s`** — max wall-clock window (default `5`).
+- **`idle_ms`** — no new data for this long (default `4000`; not applied to an
+  embedded-test suite unless set).
+- **`timeout_s`** — max wall-clock window (default `5`; an embedded-test suite
+  defaults to the sum of its per-test timeouts).
 - **`max_bytes`** — byte cap; stops early and marks the output truncated
   (default `65536`). Reads arrive in chunks, so a capture stops just *past* the
   cap: a reported byte count above `max_bytes` is expected, not a miscount.
 
 For probe-rs captures, `transport` accepts `"auto"` (default), `"rtt"`, or
-`"semihosting"`. Auto uses RTT when the ELF defines `_SEGGER_RTT`, otherwise
-semihosting. Without an ELF, auto retains RTT RAM scanning; pass an ELF or
-force semihosting for a console-only application. The output header reports
-`via RTT` or `via semihosting`. An unreadable/invalid ELF is an error, not an
-auto-detection fallback. `rtt_attach_timeout_ms` applies only to RTT.
+`"semihosting"`. Auto runs an ELF with an `.embedded_test` section as a test
+suite over semihosting; for any other ELF it uses RTT when the ELF defines
+`_SEGGER_RTT`, otherwise semihosting. Without an ELF, auto retains RTT RAM
+scanning; pass an ELF or force semihosting for a console-only application. The
+output header reports `via RTT`, `via semihosting`, or `via semihosting + RTT`.
+An unreadable/invalid ELF is an error, not an auto-detection fallback.
+`rtt_attach_timeout_ms` applies only to RTT. Forcing `"rtt"` on an
+embedded-test ELF is refused: that firmware stops at a semihosting request
+before `#[init]` and waits for a runner, so RTT would never come up.
 
 Semihosting uses probe-rs library requests for console writes, stdout/stderr,
-command line, time, errno and exit. Console data uses text decoding even if the
-ELF contains a defmt table. `stop`, `grep`, `context`, idle/timeout/byte limits,
-ANSI/noise filtering and empty/truncated reporting share the normal capture
-pipeline. `stop_on_level`, `level` and `module` need defmt metadata and do not
-apply to this text stream. Target exit ends capture without waiting for idle.
-File access and stdin/`send` are unsupported. A semihosting flush is a no-op:
-servicing a pending syscall would execute firmware and consume fresh output.
+command line, time, errno and exit. When the ELF also defines `_SEGGER_RTT`,
+the firmware's RTT up-channel 0 is read in the same loop, as `probe-rs run`
+does: RTT goes through the normal defmt/text decoder, semihosting console output
+and runner lines are plain text, and the two are kept in the order they
+happened. Without RTT, console data uses text decoding even if the ELF contains
+a defmt table. `stop`, `grep`, `context`, idle/timeout/byte limits, ANSI/noise
+filtering and empty/truncated reporting share the normal capture pipeline.
+`level` and `module` filter only the firmware's defmt log and keep runner lines.
+Target exit ends capture without waiting for idle. File access and stdin/`send`
+are unsupported. A semihosting flush is a no-op: servicing a pending syscall
+would execute firmware and consume fresh output.
 
 An ELF with embedded-test protocol 1 metadata (embedded-test >= 0.7) runs as a
 test suite: the host supplies each test address, resets between tests, honours
-ignored tests, expected panics and per-test timeouts, and emits `test NAME ...
-ok/FAILED` plus `test result: ...`. Earlier/future protocol versions produce an
-explicit error. For embedded-test only, `monitor` also starts a fresh suite,
-resetting before the first test as well as between tests. A detached ESP may already have treated
-the semihosting trap as an exception, so attach-only cannot reliably recover its
-test command. Ordinary semihosting applications still attach without reset.
-`rerun` resets and runs the entire suite per repeat. A failed test remains
-visible in the text; matching `test result:` means completion, not test success.
-Set a capture window long enough for the entire suite, for example:
+ignored tests, expected panics and per-test timeouts, and emits `running N
+tests`, `test NAME ... ok` or `test NAME ... FAILED (reason)`, and `test result:
+...`. Each test's RTT log appears before its verdict, and a failed test gets a
+stack trace before its `FAILED` line (see below). Earlier/future protocol
+versions produce an explicit error. For embedded-test only, `monitor` also
+starts a fresh suite, resetting before the first test as well as between tests.
+A detached ESP may already have treated the semihosting trap as an exception,
+so attach-only cannot reliably recover its test command. Ordinary semihosting
+applications still attach without reset. `rerun` resets and runs the entire
+suite per repeat. A failed test remains visible in the text; matching `test
+result:` means completion, not test success.
+
+A suite needs no capture bounds: with `timeout_s` unset it may run for the sum
+of its per-test timeouts, and with `idle_ms` unset it does not stop on silence,
+since a test may stay quiet for most of its timeout. The call returns when the
+suite finishes:
 
 ```json
-{"backend":"probe-rs","chip":"esp32c5","elf":"/path/to/misc_drivers",
- "stop":"test result:","timeout_s":200,"idle_ms":65000,"repeat":3}
+{"backend":"probe-rs","chip":"esp32c5","file_path":"/path/to/test-elf"}
 ```
 
-Use this with `rerun`; for `flash_monitor` use `file_path` instead of `elf` and
-omit `repeat`. Semihosting polling services core 0; multicore console capture is
-not implemented. Stopping a capture stops host servicing, so firmware can block
-at its next semihosting request until another monitor attaches.
+Semihosting polling services core 0; multicore console capture is not
+implemented. Stopping a capture stops host servicing, so firmware can block at
+its next semihosting request until another monitor attaches.
+
+### Stack traces
+
+Stack traces are unwound with the ELF's debug info and printed in the same
+shape as `probe-rs run` (`Core 0`, then `Frame N: function @ pc` with the source
+location). By default:
+
+- each failed embedded-test case, including a timeout, gets a trace of where it
+  stopped, placed before its `FAILED` line, as `probe-rs run` prints it;
+- any other probe-rs capture whose output shows `panicked at` gets a trace of
+  the firmware when the capture ended, in its own section after the output.
+  Panic handlers such as `panic-rtt-target` spin in place after printing, so
+  this shows where the panic came from. `probe-rs run` prints this one only with
+  `--always-print-stacktrace`, on Ctrl+C.
+
+`stacktrace: true` also traces a capture that shows no panic (the core is
+halted briefly and resumed), and `stacktrace: false` turns traces off. `rerun`
+with `repeat > 1` never traces.
 
 Hardware evidence and reproducible MCP stdio commands are in
 [docs/semihosting.md](docs/semihosting.md).
@@ -184,6 +217,12 @@ for the firmware to initialize RTT. An ESP32-C5 booting through the ESP-IDF
 bootloader was measured attaching in under 200 ms, so the default has ample
 headroom while still reporting a firmware that never brings RTT up. Raise it for
 a target whose bootloader runs materially longer.
+
+When RTT does not come up, the error reports the core's state if that explains
+it, rather than a list of possible causes: a core halted at a semihosting
+`SYS_GET_CMDLINE` is an embedded-test binary waiting for its runner, a core
+halted at a semihosting exit already finished, and a core halted for another
+reason stopped before RTT was initialized.
 
 **Show filters:** `grep` (regex, both modes), `context` (N lines around the
 `stop` match), and defmt-only `level` (minimum to show) / `module` (regex on the
