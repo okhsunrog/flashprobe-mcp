@@ -52,6 +52,9 @@ impl ServerHandler for Server {
                    `project_dir` if the server's cwd isn't the project; `bin` for \
                    multi-binary workspaces).\n\
                  - chip (probe-rs): from .cargo/config.toml's runner --chip.\n\
+                 - probe (probe-rs): the sole probe, or with several the only one whose \
+                   chip (read from its JTAG IDCODE) is `chip`; otherwise the error lists \
+                   each probe with its chip.\n\
                  - port (espflash): the sole USB serial port.\n\
                  - defmt vs text: from the ELF's `.defmt` section (reliable).\n\n\
                  ## Tools\n\
@@ -74,8 +77,9 @@ impl ServerHandler for Server {
                  returns on `test result:` (timeout defaults to the suite's own).\n\n\
                  ## Panics\n\
                  probe-rs captures that show `panicked at` end with a stack trace of \
-                 the firmware, as `probe-rs run --always-print-stacktrace` prints it \
-                 (`stacktrace` overrides).\n\n\
+                 the firmware (`stacktrace` overrides). Traces are short: project frames, \
+                 dependency frames folded per run, generics trimmed; `stacktrace_full` \
+                 prints them as `probe-rs run` does.\n\n\
                  ## Sending to the target\n\
                  monitor / flash_monitor / rerun take `send`: a string written to the \
                  device before reading (probe-rs: RTT down-channel 0; espflash: serial \

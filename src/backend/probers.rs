@@ -8,13 +8,13 @@
 use super::semihosting::SemihostingSource;
 use super::stacktrace::StackTracer;
 use crate::capture::ByteSource;
-use probe_rs::config::MemoryRegion;
+use probe_rs::config::{MemoryRegion, Registry};
 use probe_rs::flashing::{
     ElfLoader, ElfOptions, FlashError, FlashProgress, ImageLoader, build_loader, download_file,
     erase, erase_all,
 };
-use probe_rs::probe::DebugProbeInfo;
 use probe_rs::probe::list::Lister;
+use probe_rs::probe::{DebugProbeInfo, WireProtocol};
 use probe_rs::rtt::{ChannelMode, Rtt, ScanRegion};
 use probe_rs::semihosting::SemihostingCommand;
 use probe_rs::{BreakpointCause, CoreStatus, HaltReason, MemoryInterface, Permissions, Session};
@@ -54,8 +54,9 @@ fn register_espressif() {
 
 /// Open a session to `chip` through a connected probe. `probe_sel` optionally
 /// selects a probe by `VID:PID` or `VID:PID:SERIAL` (hex VID/PID). With no
-/// selector, a single connected probe is used; multiple probes is an error that
-/// asks the caller to disambiguate.
+/// selector, a single connected probe is used; with several, the one whose
+/// chip is identified as `chip` (see [`identify_chip`]). When that does not
+/// single one out, the error lists every probe with its chip.
 pub fn open_session(chip: &str, probe_sel: Option<&str>) -> Result<Session, String> {
     register_espressif();
 
@@ -71,14 +72,14 @@ pub fn open_session(chip: &str, probe_sel: Option<&str>) -> Result<Session, Stri
         Some(sel) => probes
             .iter()
             .find(|p| probe_matches(p, sel))
-            .ok_or_else(|| format!("No probe matches '{sel}'. Connected: {}", list_str(&probes)))?,
+            .ok_or_else(|| {
+                format!(
+                    "No probe matches '{sel}'. Connected:\n{}",
+                    probe_listing(&identify_probes(&probes))
+                )
+            })?,
         None if probes.len() == 1 => &probes[0],
-        None => {
-            return Err(format!(
-                "Multiple probes connected; pass `probe` as VID:PID[:SERIAL]. Connected: {}",
-                list_str(&probes)
-            ));
-        }
+        None => &probes[pick_by_chip(chip, &identify_probes(&probes))?],
     };
 
     let probe = info
@@ -117,18 +118,154 @@ fn selector_matches(sel: &str, vendor_id: u16, product_id: u16, serial: Option<&
     }
 }
 
-fn list_str(probes: &[DebugProbeInfo]) -> String {
+/// A probe as messages show it: `VID:PID:SERIAL (identifier)`. The part
+/// before the space is exactly what the `probe` argument takes.
+fn probe_label(p: &DebugProbeInfo) -> String {
+    let serial = p.serial_number.as_deref().unwrap_or("-");
+    format!(
+        "{:04x}:{:04x}:{serial} ({})",
+        p.vendor_id, p.product_id, p.identifier
+    )
+}
+
+/// What the chip behind a probe was identified as.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Identity {
+    Chip(String),
+    /// Chips that share the IDCODE read, such as the Xtensa ESPs.
+    OneOf(Vec<String>),
+    /// Nothing the IDCODE alone can name, e.g. an ARM target.
+    Unknown,
+    /// The probe could not be asked, typically because another program holds it.
+    Unavailable(String),
+}
+
+/// The chips an Espressif detection entry names for `idcode`. The entries
+/// map a magic value, read from the chip's memory, to a target; every RISC-V
+/// ESP has an IDCODE of its own and its magic values only tell revisions
+/// apart, so the IDCODE alone already names the chip.
+fn identity_from_idcode(registry: &Registry, idcode: u32) -> Option<Identity> {
+    let mut chips: Vec<String> = Vec::new();
+    for detection in registry
+        .families()
+        .iter()
+        .flat_map(|family| family.chip_detection.iter())
+        .filter_map(|detection| detection.as_espressif())
+        .filter(|detection| detection.idcode == idcode)
+    {
+        for chip in detection.variants.values() {
+            if !chips.contains(chip) {
+                chips.push(chip.clone());
+            }
+        }
+    }
+    match chips.len() {
+        0 => None,
+        1 => chips.pop().map(Identity::Chip),
+        _ => Some(Identity::OneOf(chips)),
+    }
+}
+
+/// The chip behind a JTAG probe, identified from the IDCODEs of its TAPs.
+///
+/// That is the case that needs it: every ESP board brings its own USB-JTAG
+/// probe, so two boards on one host are two probes that differ only in
+/// serial. Anything more (an Xtensa ESP's magic value, an ARM ROM table)
+/// needs a debug session, and attaching one has side effects on a board
+/// nobody asked to touch: the ESP sequences disable its watchdogs, and the
+/// magic value is read with the core halted. Reading IDCODEs does not involve
+/// the core.
+fn identify_chip(info: &DebugProbeInfo, registry: &Registry) -> Identity {
+    let mut probe = match info.open() {
+        Ok(probe) => probe,
+        Err(e) => return Identity::Unavailable(format!("cannot open it: {e}")),
+    };
+    if probe.protocol().is_none() && probe.select_protocol(WireProtocol::Jtag).is_err() {
+        return Identity::Unknown;
+    }
+    if probe.protocol() != Some(WireProtocol::Jtag) {
+        return Identity::Unknown;
+    }
+    if let Err(e) = probe.attach_to_unspecified() {
+        return Identity::Unavailable(format!("cannot attach to it: {e}"));
+    }
+    let Some(jtag) = probe.try_as_jtag_probe() else {
+        return Identity::Unknown;
+    };
+    let taps = match jtag.scan_chain() {
+        Ok(chain) => chain.len(),
+        Err(e) => return Identity::Unavailable(format!("cannot scan its JTAG chain: {e}")),
+    };
+    for tap in 0..taps {
+        if jtag.select_target(tap).is_err() {
+            break;
+        }
+        let Ok(bits) = jtag.read_register(1, 32) else {
+            break;
+        };
+        let idcode = bits
+            .iter()
+            .by_vals()
+            .take(32)
+            .enumerate()
+            .fold(0u32, |acc, (i, bit)| acc | (u32::from(bit) << i));
+        if let Some(identity) = identity_from_idcode(registry, idcode) {
+            return identity;
+        }
+    }
+    Identity::Unknown
+}
+
+/// Every probe with what it was identified as.
+fn identify_probes(probes: &[DebugProbeInfo]) -> Vec<(String, Identity)> {
+    let registry = Registry::from_builtin_families();
     probes
         .iter()
-        .map(|p| {
-            let serial = p.serial_number.as_deref().unwrap_or("-");
-            format!(
-                "{:04x}:{:04x}:{serial} ({})",
-                p.vendor_id, p.product_id, p.identifier
-            )
+        .map(|p| (probe_label(p), identify_chip(p, &registry)))
+        .collect()
+}
+
+/// One line per probe, with its chip where known.
+fn probe_listing(probes: &[(String, Identity)]) -> String {
+    probes
+        .iter()
+        .map(|(label, identity)| match identity {
+            Identity::Chip(chip) => format!("- {label}: {chip}"),
+            Identity::OneOf(chips) => {
+                format!("- {label}: one of {} (same JTAG IDCODE)", chips.join(", "))
+            }
+            Identity::Unknown => {
+                format!("- {label}: chip not identifiable without a debug session")
+            }
+            Identity::Unavailable(e) => format!("- {label}: not checked, {e}"),
         })
         .collect::<Vec<_>>()
-        .join(", ")
+        .join("\n")
+}
+
+/// Which of several probes to use for `chip`: the only one identified as it.
+fn pick_by_chip(chip: &str, probes: &[(String, Identity)]) -> Result<usize, String> {
+    let matches: Vec<usize> = probes
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, identity))| {
+            matches!(identity, Identity::Chip(c) if c.eq_ignore_ascii_case(chip))
+        })
+        .map(|(i, _)| i)
+        .collect();
+    if let [only] = matches[..] {
+        return Ok(only);
+    }
+    let how_many = match matches.len() {
+        0 => format!("none of them was identified as {chip}"),
+        n => format!("{n} of them are {chip}"),
+    };
+    Err(format!(
+        "{} probes are connected and {how_many}; pass `probe` as VID:PID:SERIAL to choose \
+         one:\n{}",
+        probes.len(),
+        probe_listing(probes)
+    ))
 }
 
 /// probe-rs flashes ESP chips through the IDF bootloader image; everything else
@@ -565,9 +702,9 @@ impl ByteSource for RttSource {
         Duration::from_millis(10)
     }
 
-    fn stack_trace(&mut self) -> Option<Result<String, String>> {
+    fn stack_trace(&mut self, full: bool) -> Option<Result<String, String>> {
         let tracer = self.tracer.as_mut()?;
-        Some(tracer.trace_session(&mut self.session))
+        Some(tracer.trace_session(&mut self.session, full))
     }
 }
 
@@ -606,6 +743,79 @@ mod tests {
             0x1001,
             serial
         ));
+    }
+
+    fn probes(chips: &[Identity]) -> Vec<(String, Identity)> {
+        chips
+            .iter()
+            .enumerate()
+            .map(|(i, chip)| (format!("303a:1001:0{i} (ESP JTAG)"), chip.clone()))
+            .collect()
+    }
+
+    /// The IDCODEs come from the targets' detection data: each RISC-V ESP has
+    /// its own, while the Xtensa ones share one and need the magic value.
+    #[test]
+    fn the_idcode_names_riscv_esp_chips() {
+        register_espressif();
+        let registry = Registry::from_builtin_families();
+        for (idcode, chip) in [
+            (0x5c25, "esp32c3"),
+            (0x17c25, "esp32c5"),
+            (0xdc25, "esp32c6"),
+            (0x10c25, "esp32h2"),
+        ] {
+            assert_eq!(
+                identity_from_idcode(&registry, idcode),
+                Some(Identity::Chip(chip.into()))
+            );
+        }
+        let Some(Identity::OneOf(xtensa)) = identity_from_idcode(&registry, 0x120034e5) else {
+            panic!("the Xtensa ESPs share an IDCODE");
+        };
+        assert!(xtensa.iter().any(|c| c == "esp32s3"), "{xtensa:?}");
+        assert_eq!(identity_from_idcode(&registry, 0x4ba00477), None);
+    }
+
+    #[test]
+    fn the_only_probe_with_the_chip_is_picked() {
+        let connected = probes(&[
+            Identity::Chip("esp32c6".into()),
+            Identity::Chip("esp32c5".into()),
+            Identity::Unknown,
+            Identity::Unavailable("cannot open it: busy".into()),
+        ]);
+        assert_eq!(pick_by_chip("ESP32C5", &connected), Ok(1));
+    }
+
+    #[test]
+    fn an_ambiguous_choice_lists_every_probe_with_its_chip() {
+        let connected = probes(&[
+            Identity::Chip("esp32c5".into()),
+            Identity::Chip("esp32c5".into()),
+            Identity::OneOf(vec!["esp32".into(), "esp32s3".into()]),
+            Identity::Unknown,
+            Identity::Unavailable("cannot open it: busy".into()),
+        ]);
+        let err = pick_by_chip("esp32c5", &connected).unwrap_err();
+        assert!(err.contains("2 of them are esp32c5"), "{err}");
+        assert!(err.contains("- 303a:1001:00 (ESP JTAG): esp32c5"), "{err}");
+        assert!(err.contains("one of esp32, esp32s3"), "{err}");
+        assert!(
+            err.contains("not identifiable without a debug session"),
+            "{err}"
+        );
+        assert!(
+            err.contains("04 (ESP JTAG): not checked, cannot open it"),
+            "{err}"
+        );
+
+        // A probe that may be the chip is not picked on a guess.
+        let err = pick_by_chip("esp32s3", &connected).unwrap_err();
+        assert!(
+            err.contains("none of them was identified as esp32s3"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -684,6 +894,8 @@ pub struct AttachOpts<'a> {
     pub verify_flash: bool,
     /// Unwind the stack for each failed embedded-test case.
     pub trace_failures: bool,
+    /// Print every frame of those traces instead of the short form.
+    pub full_traces: bool,
 }
 
 impl CaptureTransport {
@@ -738,6 +950,7 @@ impl CaptureTransport {
             reset,
             verify_flash,
             trace_failures,
+            full_traces,
         } = opts;
         match self {
             Self::Rtt if reset => Ok(Box::new(reset_and_attach_rtt(session, elf, rtt_timeout)?)),
@@ -748,6 +961,7 @@ impl CaptureTransport {
                 reset,
                 verify_flash,
                 trace_failures,
+                full_traces,
             )?)),
         }
     }

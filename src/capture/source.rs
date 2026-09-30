@@ -54,8 +54,10 @@ pub trait ByteSource {
     }
 
     /// A stack trace of the firmware as it is now, for a capture that ended
-    /// in a panic. `None` when this source cannot produce one.
-    fn stack_trace(&mut self) -> Option<Result<String, String>> {
+    /// in a panic; `full` for every frame instead of the short form. `None`
+    /// when this source cannot produce one.
+    fn stack_trace(&mut self, full: bool) -> Option<Result<String, String>> {
+        let _ = full;
         None
     }
 

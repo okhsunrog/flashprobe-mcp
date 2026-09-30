@@ -323,10 +323,15 @@ fn restart(session: &mut Session, rtt: Option<&mut RttLog>) -> Result<()> {
 }
 
 /// Queue a stack trace of the halted core for a failed test.
-fn trace_failure(tracer: Option<&mut StackTracer>, core: &mut Core<'_>, output: &mut Output) {
+fn trace_failure(
+    tracer: Option<&mut StackTracer>,
+    core: &mut Core<'_>,
+    full: bool,
+    output: &mut Output,
+) {
     if let Some(tracer) = tracer {
         let trace = tracer
-            .trace(core)
+            .trace(core, full)
             .unwrap_or_else(|e| format!("(no stack trace: {e})\n"));
         output.line(&trace);
     }
@@ -341,6 +346,8 @@ pub struct SemihostingSource {
     tracer: Option<StackTracer>,
     /// Unwind the stack for each failed test, as `probe-rs run` does.
     trace_failures: bool,
+    /// Every frame of those traces, instead of the short form.
+    full_traces: bool,
     done: bool,
 }
 
@@ -351,6 +358,7 @@ impl SemihostingSource {
         reset: bool,
         verify_flash: bool,
         trace_failures: bool,
+        full_traces: bool,
     ) -> Result<Self, String> {
         let data = elf
             .map(|path| std::fs::read(path).with_context(|| format!("reading {path}")))
@@ -405,6 +413,7 @@ impl SemihostingSource {
             rtt,
             tracer: elf.map(StackTracer::new),
             trace_failures,
+            full_traces,
             done: false,
         })
     }
@@ -441,7 +450,12 @@ impl SemihostingSource {
                     rtt.drain(&mut core, &mut self.output)?;
                 }
                 if self.trace_failures {
-                    trace_failure(self.tracer.as_mut(), &mut core, &mut self.output);
+                    trace_failure(
+                        self.tracer.as_mut(),
+                        &mut core,
+                        self.full_traces,
+                        &mut self.output,
+                    );
                 }
                 let line = suite.result(suite.failure(false, true));
                 self.output.line(&line);
@@ -475,7 +489,12 @@ impl SemihostingSource {
                     }
                     let failure = suite.failure(panic, false);
                     if failure.is_some() && self.trace_failures {
-                        trace_failure(self.tracer.as_mut(), &mut core, &mut self.output);
+                        trace_failure(
+                            self.tracer.as_mut(),
+                            &mut core,
+                            self.full_traces,
+                            &mut self.output,
+                        );
                     }
                     let line = suite.result(failure);
                     self.output.line(&line);
@@ -606,12 +625,12 @@ impl ByteSource for SemihostingSource {
         })
     }
     /// A suite has already traced each failed test in place.
-    fn stack_trace(&mut self) -> Option<Result<String, String>> {
+    fn stack_trace(&mut self, full: bool) -> Option<Result<String, String>> {
         if self.suite.is_some() {
             return None;
         }
         let tracer = self.tracer.as_mut()?;
-        Some(tracer.trace_session(&mut self.session))
+        Some(tracer.trace_session(&mut self.session, full))
     }
 }
 

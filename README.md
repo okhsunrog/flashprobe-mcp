@@ -80,8 +80,25 @@ file, no state) and can be overridden per call:
 |---------|------|----------|
 | ELF / file to flash | `cargo metadata`, then the **more recently built** of `release/` and `debug/` | `file_path` / `elf`, `project_dir`, `bin` |
 | chip (probe-rs) | `.cargo/config.toml` runner `--chip` | `chip` |
+| debug probe (probe-rs) | the sole probe, or the only one whose chip is `chip` | `probe` |
 | serial port (espflash) | the sole USB serial port | `port` |
 | defmt vs text | the ELF's `.defmt` section | — (reliable) |
+
+With several probes connected and no `probe` given, each probe's chip is read
+from the JTAG IDCODEs of its TAPs, and the one probe identified as `chip` is
+used. That tells ESP boards apart, since each brings its own USB-JTAG probe and
+the RISC-V ESPs have an IDCODE each. No debug session is opened on the other
+boards: attaching one runs the chip's connect sequence, which on an ESP disables
+its watchdogs, and reading a magic value halts the core. So the Xtensa ESPs,
+which share an IDCODE, come out as "one of esp32, esp32s2, esp32s3", and a
+probe that is not JTAG (an ARM target over SWD) as unidentified. When no single
+probe matches, the error lists every probe with its chip:
+
+```
+2 probes are connected and none of them was identified as esp32h2; pass `probe` as VID:PID:SERIAL to choose one:
+- 303a:1001:3C:DC:75:8E:15:98 (ESP JTAG): esp32c5
+- 303a:1001:58:E6:C5:17:35:7C (ESP JTAG): esp32c6
+```
 
 So from a project directory, `flash_monitor { "backend": "probe-rs", "stop":
 "ready" }` flashes the built artifact to the detected chip and decodes defmt —
@@ -189,9 +206,7 @@ its next semihosting request until another monitor attaches.
 
 ### Stack traces
 
-Stack traces are unwound with the ELF's debug info and printed in the same
-shape as `probe-rs run` (`Core 0`, then `Frame N: function @ pc` with the source
-location). By default:
+Stack traces are unwound with the ELF's debug info. By default:
 
 - each failed embedded-test case, including a timeout, gets a trace of where it
   stopped, placed before its `FAILED` line, as `probe-rs run` prints it;
@@ -204,6 +219,39 @@ location). By default:
 `stacktrace: true` also traces a capture that shows no panic (the core is
 halted briefly and resumed), and `stacktrace: false` turns traces off. `rerun`
 with `repeat > 1` never traces.
+
+The trace is short by default. Most frames of an embedded Rust stack are the
+panic machinery, the executor and the startup code, and their names carry
+whole future types, so a full trace of one failed async test runs to kilobytes.
+The short form prints the project's own frames (anything outside the cargo
+registry, git checkouts and the standard library, so path dependencies count
+as the project), folds each run of dependency frames into one line naming its
+crates, and trims generic arguments to `<…>`. The run at the top of the stack
+also lists its functions, since they say what the core was doing:
+
+```
+Core 0 (27 frames; dependency frames folded, generics trimmed; stacktrace_full: true shows them all)
+    Frames 0-9 (semihosting, embedded-test, core, defmt): syscall_readonly ← sys_exit_extended ← exit ← exit ← abort ← panic ← panic_fmt ← panic ← default_panic ← panic
+    Frame 10: check_value @ 0x420030e4
+        /path/to/project/tests/panic_suite.rs:11:9
+    Frame 11: {async_fn#0} @ 0x4200301a
+        /path/to/project/tests/panic_suite.rs:37:9
+    Frames 13-19 (embassy-executor, esp-rtos)
+    Frame 20: __b_panics_entrypoint @ 0x420032e2
+        /path/to/project/tests/panic_suite.rs:15:1
+    Frames 21-26 (embedded-test, esp-hal, riscv-rt, no source)
+```
+
+`stacktrace_full: true` prints every frame with its full name, exactly as
+`probe-rs run` does.
+
+The trace shows where a panic happened; the message is whatever the firmware
+logged. embedded-test's panic handler logs the `PanicInfo` through defmt, whose
+`Format` for it prints only the location, so the text of an `expect("...")`
+never leaves the target, under `probe-rs run` as well. To see it, panic through
+defmt (`defmt::unwrap!(x, "...")`, `defmt::panic!`), or turn off embedded-test's
+`panic-handler` feature and log `defmt::Display2Format(info)` from your own
+handler before `semihosting::process::abort()`.
 
 Hardware evidence and reproducible MCP stdio commands are in
 [docs/semihosting.md](docs/semihosting.md).

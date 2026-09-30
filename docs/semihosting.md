@@ -195,3 +195,26 @@ finishes; and a plain `panic-rtt-target` app that panics after four ticks.
 | Semihosting-only suite (`misc_drivers`, no RTT) | `via semihosting`, text mode, 13/13 |
 
 The suite binary under investigation was left flashed on the board.
+
+## Short stack traces and probe selection, 2026-09-30
+
+Traces are now short by default: the project's frames in full, each run of
+dependency frames (cargo registry, git checkouts, the standard library) folded
+into one line naming its crates, the top run also listing its functions, and
+generic arguments trimmed to `<…>`. `stacktrace_full: true` restores the
+`probe-rs run` output. With several probes and no `probe`, the probe whose JTAG
+IDCODE names `chip` is used; otherwise the error lists each probe with its chip.
+
+Checked on the same bench, now with an ESP32-C6 (`303a:1001:58:E6:C5:17:35:7C`)
+connected next to the ESP32-C5:
+
+| Check | Observed result |
+| --- | --- |
+| `chip_info`, `chip: "esp32c5"`, no `probe` | ESP32-C5 selected, 0.45 s including server start |
+| `chip_info`, `chip: "esp32c6"`, no `probe` | ESP32-C6 selected |
+| `chip_info`, `chip: "esp32h2"`, no `probe` | Error listing `…15:98: esp32c5` and `…35:7C: esp32c6` |
+| Panic fixture suite, `flash_monitor` without `probe` | Same verdicts; output 3.8 KB instead of 10.7 KB; every project frame kept, top runs `abort ← panic_fmt …` and `wait_for_interrupt ← idle_hook` |
+| Same suite, `rerun` with `stacktrace_full: true` | All 51 frame and location lines identical to `probe-rs run` |
+| Plain `panic-rtt-target` app | Short trace: `check_value` and the calling `async fn` with their lines, 20 frames folded to 7 lines |
+
+The `ergot_can` suite was flashed back afterwards (2/2).

@@ -47,7 +47,8 @@ pub struct ChipInfoInput {
     pub port: Option<String>,
     /// Chip/target name (probe-rs). Auto-detected from .cargo/config.toml if omitted.
     pub chip: Option<String>,
-    /// probe-rs probe selector VID:PID[:SERIAL] (hex). Omit if only one probe.
+    /// probe-rs probe selector VID:PID[:SERIAL] (hex). Omit it to use the only
+    /// probe, or with several the only one whose chip (from its JTAG IDCODE) is `chip`.
     pub probe: Option<String>,
     /// Project directory for chip auto-detection (defaults to cwd).
     pub project_dir: Option<String>,
@@ -67,7 +68,8 @@ pub struct FlashInput {
     /// Chip/target name (probe-rs), e.g. "esp32c6", "stm32g431cbtx".
     /// Auto-detected from .cargo/config.toml if omitted.
     pub chip: Option<String>,
-    /// probe-rs probe selector as VID:PID[:SERIAL] (hex). Omit if only one probe.
+    /// probe-rs probe selector as VID:PID[:SERIAL] (hex). Omit it to use the only
+    /// probe, or with several the only one whose chip (from its JTAG IDCODE) is `chip`.
     pub probe: Option<String>,
     /// Project directory for auto-detection (defaults to cwd).
     pub project_dir: Option<String>,
@@ -206,7 +208,8 @@ pub struct MonitorInput {
     pub port: Option<String>,
     /// Chip/target name (probe-rs). Auto-detected from .cargo/config.toml if omitted.
     pub chip: Option<String>,
-    /// probe-rs probe selector as VID:PID[:SERIAL] (hex). Omit if only one probe.
+    /// probe-rs probe selector as VID:PID[:SERIAL] (hex). Omit it to use the only
+    /// probe, or with several the only one whose chip (from its JTAG IDCODE) is `chip`.
     pub probe: Option<String>,
     /// Project directory for auto-detection (defaults to cwd).
     pub project_dir: Option<String>,
@@ -296,6 +299,13 @@ pub struct MonitorInput {
     /// the end of any other capture whose output shows `panicked at`. true:
     /// also at the end of a capture that shows no panic. false: never.
     pub stacktrace: Option<bool>,
+    /// Print every stack frame with its full name, exactly as `probe-rs run`
+    /// does (default: false). The default short trace shows the project's own
+    /// frames, folds each run of dependency frames (crates.io, git, core/std)
+    /// into one line naming its crates (the top run also lists its functions),
+    /// and trims generic arguments to `<…>`.
+    #[serde(default)]
+    pub stacktrace_full: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -306,7 +316,8 @@ pub struct FlashMonitorInput {
     pub port: Option<String>,
     /// Chip/target name (probe-rs). Auto-detected from .cargo/config.toml if omitted.
     pub chip: Option<String>,
-    /// probe-rs probe selector as VID:PID[:SERIAL] (hex). Omit if only one probe.
+    /// probe-rs probe selector as VID:PID[:SERIAL] (hex). Omit it to use the only
+    /// probe, or with several the only one whose chip (from its JTAG IDCODE) is `chip`.
     pub probe: Option<String>,
     /// Project directory for auto-detection (defaults to cwd).
     pub project_dir: Option<String>,
@@ -393,6 +404,13 @@ pub struct FlashMonitorInput {
     /// the end of any other capture whose output shows `panicked at`. true:
     /// also at the end of a capture that shows no panic. false: never.
     pub stacktrace: Option<bool>,
+    /// Print every stack frame with its full name, exactly as `probe-rs run`
+    /// does (default: false). The default short trace shows the project's own
+    /// frames, folds each run of dependency frames (crates.io, git, core/std)
+    /// into one line naming its crates (the top run also lists its functions),
+    /// and trims generic arguments to `<…>`.
+    #[serde(default)]
+    pub stacktrace_full: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -403,7 +421,8 @@ pub struct RerunInput {
     pub port: Option<String>,
     /// Chip/target name (probe-rs). Auto-detected from .cargo/config.toml if omitted.
     pub chip: Option<String>,
-    /// probe-rs probe selector as VID:PID[:SERIAL] (hex). Omit if only one probe.
+    /// probe-rs probe selector as VID:PID[:SERIAL] (hex). Omit it to use the only
+    /// probe, or with several the only one whose chip (from its JTAG IDCODE) is `chip`.
     pub probe: Option<String>,
     /// Project directory for auto-detection (defaults to cwd).
     pub project_dir: Option<String>,
@@ -482,4 +501,11 @@ pub struct RerunInput {
     /// the end of any other capture whose output shows `panicked at`. true:
     /// also at the end of a capture that shows no panic. false: never.
     pub stacktrace: Option<bool>,
+    /// Print every stack frame with its full name, exactly as `probe-rs run`
+    /// does (default: false). The default short trace shows the project's own
+    /// frames, folds each run of dependency frames (crates.io, git, core/std)
+    /// into one line naming its crates (the top run also lists its functions),
+    /// and trims generic arguments to `<…>`.
+    #[serde(default)]
+    pub stacktrace_full: bool,
 }

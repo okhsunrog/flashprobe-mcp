@@ -89,6 +89,7 @@ impl Server {
                                     reset: false,
                                     verify_flash: true,
                                     trace_failures: input.stacktrace != Some(false),
+                                    full_traces: input.stacktrace_full,
                                 },
                             )?,
                             format!("Probe: {chip} via {}", transport.label()),
@@ -114,7 +115,12 @@ impl Server {
             };
             send_delay(opts.send.as_ref(), input.send_delay_ms);
             let (result, stats) = capture(source.as_mut(), &mode, &opts)?;
-            let trace = stack_trace_section(source.as_mut(), &result, input.stacktrace);
+            let trace = stack_trace_section(
+                source.as_mut(),
+                &result,
+                input.stacktrace,
+                input.stacktrace_full,
+            );
 
             let header = format!(
                 "{header}{}{}",
@@ -213,6 +219,7 @@ impl Server {
                             // Just flashed from this very file.
                             verify_flash: false,
                             trace_failures: input.stacktrace != Some(false),
+                            full_traces: input.stacktrace_full,
                         },
                     )?;
                     (
@@ -247,7 +254,12 @@ impl Server {
             };
             send_delay(opts.send.as_ref(), input.send_delay_ms);
             let (result, stats) = capture(source.as_mut(), &mode, &opts)?;
-            let trace = stack_trace_section(source.as_mut(), &result, input.stacktrace);
+            let trace = stack_trace_section(
+                source.as_mut(),
+                &result,
+                input.stacktrace,
+                input.stacktrace_full,
+            );
 
             let header = format!(
                 "{header}{}{}",
@@ -357,6 +369,7 @@ impl Server {
                                 reset: true,
                                 verify_flash: true,
                                 trace_failures: stacktrace != Some(false),
+                                full_traces: input.stacktrace_full,
                             },
                         )?
                     }
@@ -384,7 +397,12 @@ impl Server {
                 send_delay(opts.send.as_ref(), input.send_delay_ms);
                 let (result, stats) = capture(source.as_mut(), &mode, &opts)?;
                 Ok(Cycle {
-                    trace: stack_trace_section(source.as_mut(), &result, stacktrace),
+                    trace: stack_trace_section(
+                        source.as_mut(),
+                        &result,
+                        stacktrace,
+                        input.stacktrace_full,
+                    ),
                     note: source_note(source.as_ref()),
                     result,
                     stats,
@@ -509,15 +527,17 @@ fn shows_panic(result: &CaptureResult) -> bool {
 /// A stack trace of the firmware after the capture, rendered as its own
 /// section. `stacktrace` is the tool argument: unset traces only a capture
 /// that shows a panic, since that is when the frames say where it happened.
+/// `full` is `stacktrace_full`.
 fn stack_trace_section(
     source: &mut dyn ByteSource,
     result: &CaptureResult,
     stacktrace: Option<bool>,
+    full: bool,
 ) -> String {
     if !stacktrace.unwrap_or_else(|| shows_panic(result)) {
         return String::new();
     }
-    match source.stack_trace() {
+    match source.stack_trace(full) {
         None => String::new(),
         Some(Ok(trace)) => format!("\n\nStack trace when the capture ended:\n\n```\n{trace}```"),
         Some(Err(e)) => format!("\n\nNo stack trace: {e}"),
