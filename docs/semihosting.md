@@ -218,3 +218,22 @@ connected next to the ESP32-C5:
 | Plain `panic-rtt-target` app | Short trace: `check_value` and the calling `async fn` with their lines, 20 frames folded to 7 lines |
 
 The `ergot_can` suite was flashed back afterwards (2/2).
+
+### RTT failure with another build in the flash
+
+A hardware check flashed the `ergot_can` suite and then called `rerun` with the
+ELF of a plain RTT app. The error named the core's state correctly (halted at
+`SYS_GET_CMDLINE`) but advised the semihosting transport, which cannot help:
+the ELF passed was not the firmware on the device. When the core has stopped
+and the capture did not just flash the ELF, the flash is now compared with the
+ELF first. The same call now reports "The flash does not hold the image built
+from '…panic-app': the device runs a different build, whose core is halted at
+a semihosting SYS_GET_CMDLINE request, … Flash this ELF first" in 2.9 s
+including server start.
+
+Rechecked after `flash` of the current `ergot_can` build (3 tests by then):
+`monitor` with the app's ELF reports the mismatch with the core "halted at a
+semihosting exit" (the suite, with no host answering, aborted), without
+probe-rs' generic RTT hints; `rerun` reports it at `SYS_GET_CMDLINE`. With the
+matching ELF, `flash_monitor` and `monitor` both ran 3/3. The flash comparison
+agrees with `probe-rs verify` on six ELFs.

@@ -307,44 +307,106 @@ pub fn verify_flash(session: &mut Session, path: &str, chip: &str) -> Result<boo
     }
 }
 
+/// Where the core stopped, when it stopped before RTT came up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Stuck {
+    /// At SYS_GET_CMDLINE, the way an embedded-test binary waits for its runner.
+    CommandLine,
+    /// At a semihosting exit.
+    Exited,
+    /// At another semihosting request, waiting for a host to answer it.
+    Semihosting,
+    /// For another reason, e.g. an exception.
+    Halted(String),
+    LockedUp,
+}
+
+impl Stuck {
+    fn of(session: &mut Session) -> Option<Self> {
+        let status = session.core(0).ok()?.status().ok()?;
+        Some(match status {
+            CoreStatus::Halted(HaltReason::Breakpoint(BreakpointCause::Semihosting(command))) => {
+                match command {
+                    SemihostingCommand::GetCommandLine(_) => Self::CommandLine,
+                    SemihostingCommand::ExitSuccess | SemihostingCommand::ExitError(_) => {
+                        Self::Exited
+                    }
+                    _ => Self::Semihosting,
+                }
+            }
+            CoreStatus::Halted(reason) => Self::Halted(format!("{reason:?}")),
+            CoreStatus::LockedUp => Self::LockedUp,
+            _ => return None,
+        })
+    }
+
+    fn describe(&self) -> String {
+        match self {
+            Self::CommandLine => "halted at a semihosting SYS_GET_CMDLINE request, the way an \
+                                  embedded-test binary waits for its runner"
+                .into(),
+            Self::Exited => "halted at a semihosting exit".into(),
+            Self::Semihosting => {
+                "halted at a semihosting request, waiting for a host to answer it".into()
+            }
+            Self::Halted(reason) => format!("halted ({reason})"),
+            Self::LockedUp => "locked up".into(),
+        }
+    }
+}
+
 /// Why RTT never came up, when the core's state says so.
 ///
 /// A timeout alone cannot tell a firmware that is slow to initialize RTT from
 /// one that will never get there. A core that is halted settles it, and the
 /// halt reason usually names the fix, so a caller need not guess.
-fn halted_diagnosis(session: &mut Session) -> Option<String> {
-    let status = session.core(0).ok()?.status().ok()?;
-    let command = match status {
-        CoreStatus::Halted(HaltReason::Breakpoint(BreakpointCause::Semihosting(command))) => {
-            command
-        }
-        CoreStatus::Halted(reason) => {
+///
+/// Where it stopped only means something for the firmware `elf` describes,
+/// though. `check_flash` says the flash may hold another build (the capture
+/// did not just flash `elf`); the flash is then compared with `elf` first, and
+/// a mismatch is the answer. That comparison stops the core, so it only runs
+/// on a core that has already stopped by itself.
+fn rtt_failure_cause(
+    session: &mut Session,
+    elf: Option<&str>,
+    check_flash: bool,
+) -> Option<String> {
+    let stuck = Stuck::of(session)?;
+    let what = stuck.describe();
+    if check_flash && let Some(path) = elf {
+        let chip = session.target().name.clone();
+        if verify_flash(session, path, &chip) == Ok(false) {
             return Some(format!(
-                "The core is halted ({reason:?}), so the firmware stopped before it initialized RTT."
+                "The flash does not hold the image built from '{path}': the device runs a \
+                 different build, whose core is {what}. Flash this ELF first (`flash_monitor` \
+                 with it), or pass the ELF of the firmware that is on the device."
             ));
         }
-        CoreStatus::LockedUp => {
-            return Some("The core is locked up, so the firmware never got to RTT.".into());
+    }
+    Some(match (stuck, elf) {
+        // The flash holds `elf`, and RTT was chosen for it, so it has no
+        // `.embedded_test` section: the firmware asks for its command line itself.
+        (Stuck::CommandLine, Some(path)) => format!(
+            "The core is halted at a semihosting SYS_GET_CMDLINE request. '{path}' is not an \
+             embedded-test binary, so the firmware asks the host for its command line itself, \
+             and only the semihosting transport answers that. Run it with transport \
+             \"semihosting\"."
+        ),
+        (Stuck::CommandLine, None) => format!(
+            "The core is {what}, before `#[init]` sets up RTT. Pass the ELF of that test \
+             binary as `elf`: \"auto\" then runs it as a suite over semihosting and reads \
+             its RTT log alongside."
+        ),
+        (Stuck::Exited, _) => format!(
+            "The core is {what}: the firmware finished before it initialized RTT. Run it with \
+             transport \"semihosting\" to see its exit status."
+        ),
+        (Stuck::Semihosting, _) => {
+            format!("The core is {what}. Run it with transport \"semihosting\".")
         }
-        _ => return None,
-    };
-    Some(match command {
-        SemihostingCommand::GetCommandLine(_) => {
-            "The core is halted at a semihosting SYS_GET_CMDLINE request: the firmware is \
-             waiting for a host runner to tell it what to run. That is how an embedded-test \
-             binary starts, before `#[init]` sets up RTT. Run it with transport \"semihosting\", \
-             which is what \"auto\" picks for an ELF with an `.embedded_test` section; its RTT \
-             log is read alongside."
-                .into()
+        (Stuck::Halted(_) | Stuck::LockedUp, _) => {
+            format!("The core is {what}, so the firmware stopped before it initialized RTT.")
         }
-        SemihostingCommand::ExitSuccess | SemihostingCommand::ExitError(_) => {
-            "The core is halted at a semihosting exit: the firmware finished before it \
-             initialized RTT. Run it with transport \"semihosting\" to see its exit status."
-                .into()
-        }
-        _ => "The core is halted at a semihosting request and is waiting for a host to \
-              answer it. Run it with transport \"semihosting\"."
-            .into(),
     })
 }
 
@@ -385,10 +447,14 @@ pub fn reset(session: &mut Session) -> Result<(), String> {
 ///
 /// If the ELF has no `_SEGGER_RTT` symbol we fall back to the slow RAM scan,
 /// which is correct but may miss early frames on large-RAM targets.
+///
+/// `check_flash`: the flash may hold another build than `elf_path`, which a
+/// failure to attach then checks (see [`rtt_failure_cause`]).
 pub fn reset_and_attach_rtt(
     mut session: Session,
     elf_path: Option<&str>,
     attach_timeout: Duration,
+    check_flash: bool,
 ) -> Result<RttSource, String> {
     let exact = elf_path.and_then(rtt_control_block_addr);
     let region = match exact {
@@ -425,7 +491,7 @@ pub fn reset_and_attach_rtt(
             Some(rtt) => break rtt,
             None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
             None => {
-                if let Some(cause) = halted_diagnosis(&mut session) {
+                if let Some(cause) = rtt_failure_cause(&mut session, elf_path, check_flash) {
                     return Err(format!(
                         "RTT control block did not appear within {:.1}s after reset. {cause}",
                         attach_timeout.as_secs_f32()
@@ -594,10 +660,13 @@ impl RttSource {
     /// ([`ScanRegion::Exact`]) — without it, a whole-RAM scan can find STALE
     /// control blocks left by previous firmware images in uninitialized RAM
     /// (CCMRAM/SRAM2 on STM32, etc.) and fail with "multiple control blocks".
+    ///
+    /// `check_flash` is as for [`reset_and_attach_rtt`].
     pub fn attach(
         mut session: Session,
         elf_path: Option<&str>,
         attach_timeout: Duration,
+        check_flash: bool,
     ) -> Result<Self, String> {
         let region = match elf_path.and_then(rtt_control_block_addr) {
             Some(addr) => ScanRegion::Exact(addr),
@@ -617,13 +686,20 @@ impl RttSource {
                 Ok(rtt) => break rtt,
                 Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
                 Err(e) => {
-                    let cause = halted_diagnosis(&mut session).unwrap_or_else(|| {
-                        "Is the firmware running and built with an RTT transport?".into()
-                    });
-                    return Err(format!(
-                        "Failed to attach RTT within {:.1}s: {e}. {cause}",
-                        attach_timeout.as_secs_f32()
-                    ));
+                    let within = attach_timeout.as_secs_f32();
+                    // A known cause replaces probe-rs' generic hints rather than
+                    // trailing after them.
+                    return Err(
+                        match rtt_failure_cause(&mut session, elf_path, check_flash) {
+                            Some(cause) => {
+                                format!("Failed to attach RTT within {within:.1}s. {cause}")
+                            }
+                            None => format!(
+                                "Failed to attach RTT within {within:.1}s: {e}\nIs the firmware \
+                                 running and built with an RTT transport?"
+                            ),
+                        },
+                    );
                 }
             }
         };
@@ -889,8 +965,10 @@ pub struct AttachOpts<'a> {
     pub rtt_timeout: Duration,
     /// Reset first, so the capture starts at the beginning of the run.
     pub reset: bool,
-    /// Check that the flash holds `elf` before running an embedded-test suite.
-    /// `false` right after flashing that same file, when it could only pass.
+    /// The flash may hold another build than `elf`, so check it: before running
+    /// an embedded-test suite, and on RTT when a stopped core keeps RTT from
+    /// coming up. `false` right after flashing that same file, when it could
+    /// only pass.
     pub verify_flash: bool,
     /// Unwind the stack for each failed embedded-test case.
     pub trace_failures: bool,
@@ -953,8 +1031,18 @@ impl CaptureTransport {
             full_traces,
         } = opts;
         match self {
-            Self::Rtt if reset => Ok(Box::new(reset_and_attach_rtt(session, elf, rtt_timeout)?)),
-            Self::Rtt => Ok(Box::new(RttSource::attach(session, elf, rtt_timeout)?)),
+            Self::Rtt if reset => Ok(Box::new(reset_and_attach_rtt(
+                session,
+                elf,
+                rtt_timeout,
+                verify_flash,
+            )?)),
+            Self::Rtt => Ok(Box::new(RttSource::attach(
+                session,
+                elf,
+                rtt_timeout,
+                verify_flash,
+            )?)),
             Self::Semihosting { .. } => Ok(Box::new(SemihostingSource::attach(
                 session,
                 elf,

@@ -267,10 +267,17 @@ headroom while still reporting a firmware that never brings RTT up. Raise it for
 a target whose bootloader runs materially longer.
 
 When RTT does not come up, the error reports the core's state if that explains
-it, rather than a list of possible causes: a core halted at a semihosting
-`SYS_GET_CMDLINE` is an embedded-test binary waiting for its runner, a core
-halted at a semihosting exit already finished, and a core halted for another
-reason stopped before RTT was initialized.
+it, rather than a list of possible causes. Where the core stopped only means
+something for the firmware the ELF describes, so when the capture did not just
+flash that ELF (`monitor`, `rerun`) and the core has stopped, the flash is first
+compared with the ELF. A mismatch is reported as such: the device runs a
+different build, and the fix is to flash this ELF or pass the right one. With a
+matching flash, a core halted at a semihosting `SYS_GET_CMDLINE` is firmware
+that asks the host for its command line (with no ELF given, most likely an
+embedded-test binary waiting for its runner), a core halted at a semihosting
+exit already finished, and a core halted for another reason stopped before RTT
+was initialized. The comparison halts the core, so it is skipped while the
+core is still running.
 
 **Show filters:** `grep` (regex, both modes), `context` (N lines around the
 `stop` match), and defmt-only `level` (minimum to show) / `module` (regex on the
