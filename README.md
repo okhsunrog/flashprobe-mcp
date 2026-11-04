@@ -47,6 +47,11 @@ Flash/rerun capture preserves the ELF loader's RAM-versus-flash boot decision.
 BL702/BL704 remain debug-only. A BL706 flash ELF must already contain a valid boot
 header; the `bl706-embassy` Cargo runner prepares `heartbeat.flash.elf` for this.
 
+Pinecil V2 hardware validation: flash `flash_monitor` produced fresh RTT ticks
+0/1/2, three `rerun` cycles each reached tick 2, and a RAM-only ELF also started
+correctly through `flash_monitor`. A plain `monitor` observed the flash program
+after a physical power-cycle without resetting or rewriting the target.
+
 ## Configure your MCP client
 
 ```sh
