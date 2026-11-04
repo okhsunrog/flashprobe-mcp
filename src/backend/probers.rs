@@ -8,14 +8,14 @@
 use super::semihosting::SemihostingSource;
 use super::stacktrace::StackTracer;
 use crate::capture::ByteSource;
-use probe_rs::config::{MemoryRegion, Registry};
+use probe_rs::config::{DebugSequence, MemoryRegion, Registry, Target};
 use probe_rs::flashing::{
     ElfLoader, ElfOptions, FlashError, FlashProgress, ImageLoader, build_loader, download_file,
     erase, erase_all,
 };
 use probe_rs::probe::list::Lister;
 use probe_rs::probe::{DebugProbeInfo, WireProtocol};
-use probe_rs::rtt::{ChannelMode, Rtt, ScanRegion};
+use probe_rs::rtt::{ChannelMode, Rtt, RttTarget, ScanRegion};
 use probe_rs::semihosting::SemihostingCommand;
 use probe_rs::{BreakpointCause, CoreStatus, HaltReason, MemoryInterface, Permissions, Session};
 use std::time::{Duration, Instant};
@@ -82,12 +82,28 @@ pub fn open_session(chip: &str, probe_sel: Option<&str>) -> Result<Session, Stri
         None => &probes[pick_by_chip(chip, &identify_probes(&probes))?],
     };
 
-    let probe = info
+    let mut probe = info
         .open()
         .map_err(|e| format!("Failed to open probe '{}': {e}", info.identifier))?;
+    let target = Registry::from_builtin_families()
+        .get_target_by_name(chip)
+        .map_err(|e| format!("Unknown target '{chip}': {e}"))?;
+    if requires_jtag(&target) {
+        probe
+            .select_protocol(WireProtocol::Jtag)
+            .map_err(|e| format!("Failed to select JTAG for '{chip}': {e}"))?;
+    }
     probe
         .attach(chip, Permissions::default())
         .map_err(|e| format!("Failed to attach to '{chip}': {e}"))
+}
+
+fn requires_jtag(target: &Target) -> bool {
+    // RP235x RISC-V is reached through an ARM DAP and uses an Arm sequence.
+    matches!(
+        target.debug_sequence,
+        DebugSequence::Riscv(_) | DebugSequence::Xtensa(_)
+    )
 }
 
 /// `true` if the probe matches a `VID:PID` or `VID:PID:SERIAL` selector (hex).
@@ -146,16 +162,24 @@ enum Identity {
 /// apart, so the IDCODE alone already names the chip.
 fn identity_from_idcode(registry: &Registry, idcode: u32) -> Option<Identity> {
     let mut chips: Vec<String> = Vec::new();
-    for detection in registry
-        .families()
-        .iter()
-        .flat_map(|family| family.chip_detection.iter())
-        .filter_map(|detection| detection.as_espressif())
-        .filter(|detection| detection.idcode == idcode)
-    {
-        for chip in detection.variants.values() {
-            if !chips.contains(chip) {
-                chips.push(chip.clone());
+    for family in registry.families() {
+        for detection in family
+            .chip_detection
+            .iter()
+            .filter_map(|detection| detection.as_espressif())
+            .filter(|detection| detection.idcode == idcode)
+        {
+            if detection.variants.is_empty() && family.variants.len() == 1 {
+                let name = &family.variants[0].name;
+                if !chips.contains(name) {
+                    chips.push(name.clone());
+                }
+            } else {
+                for chip in detection.variants.values() {
+                    if !chips.contains(chip) {
+                        chips.push(chip.clone());
+                    }
+                }
             }
         }
     }
@@ -189,27 +213,14 @@ fn identify_chip(info: &DebugProbeInfo, registry: &Registry) -> Identity {
     if let Err(e) = probe.attach_to_unspecified() {
         return Identity::Unavailable(format!("cannot attach to it: {e}"));
     }
-    let Some(jtag) = probe.try_as_jtag_probe() else {
+    let Some(mut jtag) = probe.try_as_jtag_chain() else {
         return Identity::Unknown;
     };
-    let taps = match jtag.scan_chain() {
-        Ok(chain) => chain.len(),
-        Err(e) => return Identity::Unavailable(format!("cannot scan its JTAG chain: {e}")),
-    };
-    for tap in 0..taps {
-        if jtag.select_target(tap).is_err() {
-            break;
-        }
-        let Ok(bits) = jtag.read_register(1, 32) else {
-            break;
-        };
-        let idcode = bits
-            .iter()
-            .by_vals()
-            .take(32)
-            .enumerate()
-            .fold(0u32, |acc, (i, bit)| acc | (u32::from(bit) << i));
-        if let Some(identity) = identity_from_idcode(registry, idcode) {
+    if let Err(e) = jtag.scan_chain() {
+        return Identity::Unavailable(format!("cannot scan its JTAG chain: {e}"));
+    }
+    for idcode in jtag.idcodes().iter().flatten() {
+        if let Some(identity) = identity_from_idcode(registry, *idcode) {
             return identity;
         }
     }
@@ -471,7 +482,8 @@ pub fn reset_and_attach_rtt(
         // Invalidate a stale control block (magic + pointers from the previous
         // run) so the poll loop below can't latch onto it before the firmware
         // re-initializes RTT with a fresh read pointer at 0.
-        if let Ok(addr) = Rtt::find_control_block(&mut core, &region) {
+        let target = RttTarget::from(&core);
+        if let Ok(addr) = Rtt::find_control_block(&mut core, &target, &region) {
             let zeros = vec![0u8; Rtt::control_block_size()];
             let _ = core.write(addr, &zeros);
         }
@@ -485,7 +497,8 @@ pub fn reset_and_attach_rtt(
             let mut core = session
                 .core(0)
                 .map_err(|e| format!("Failed to access core: {e}"))?;
-            Rtt::attach_region(&mut core, &region).ok()
+            let target = RttTarget::from(&core);
+            Rtt::attach_region(&mut core, &target, &region).ok()
         };
         match attached {
             Some(rtt) => break rtt,
@@ -564,8 +577,15 @@ pub fn erase_flash(session: &mut Session) -> Result<String, String> {
 pub fn erase_region(session: &mut Session, address: u32, size: u32) -> Result<String, String> {
     let start = address as u64;
     let end = start + size as u64;
-    erase(session, &mut FlashProgress::empty(), start, end, false)
-        .map_err(|e| format!("probe-rs erase failed: {e}"))?;
+    erase(
+        session,
+        &mut FlashProgress::empty(),
+        start,
+        end,
+        false,
+        false,
+    )
+    .map_err(|e| format!("probe-rs erase failed: {e}"))?;
     Ok(format!(
         "Successfully erased the sectors covering 0x{size:x} bytes at 0x{address:08x}"
     ))
@@ -680,7 +700,8 @@ impl RttSource {
                 let mut core = session
                     .core(0)
                     .map_err(|e| format!("Failed to access core: {e}"))?;
-                Rtt::attach_region(&mut core, &region)
+                let target = RttTarget::from(&core);
+                Rtt::attach_region(&mut core, &target, &region)
             };
             match attached {
                 Ok(rtt) => break rtt,
@@ -796,6 +817,24 @@ impl Drop for RttSource {
 mod tests {
     use super::*;
     use probe_rs::config::Registry;
+
+    #[test]
+    fn direct_debug_modules_use_jtag_but_arm_daps_keep_their_protocol() {
+        register_espressif();
+        let registry = Registry::from_builtin_families();
+        for chip in ["BL706", "esp32c3", "esp32s3"] {
+            assert!(
+                requires_jtag(&registry.get_target_by_name(chip).unwrap()),
+                "{chip}"
+            );
+        }
+        for chip in ["RP235x_riscv", "STM32F103C8"] {
+            assert!(
+                !requires_jtag(&registry.get_target_by_name(chip).unwrap()),
+                "{chip}"
+            );
+        }
+    }
 
     #[test]
     fn selector_keeps_colons_in_serial() {

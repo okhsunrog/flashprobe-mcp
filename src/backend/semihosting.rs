@@ -5,7 +5,7 @@ use crate::backend::stacktrace::StackTracer;
 use crate::capture::{ByteSource, Stream};
 use anyhow::{Context, Result, bail};
 use object::{Object, ObjectSection, ObjectSymbol, SymbolKind};
-use probe_rs::rtt::{ChannelMode, Rtt, ScanRegion};
+use probe_rs::rtt::{ChannelMode, Rtt, RttTarget, ScanRegion};
 use probe_rs::{
     BreakpointCause, Core, CoreStatus, HaltReason, MemoryInterface, Session,
     semihosting::SemihostingCommand,
@@ -275,7 +275,9 @@ impl RttLog {
     /// up-channel 0.
     fn drain(&mut self, core: &mut Core<'_>, output: &mut Output) -> Result<()> {
         if self.rtt.is_none() {
-            let Ok(mut rtt) = Rtt::attach_region(core, &ScanRegion::Exact(self.addr)) else {
+            let target = RttTarget::from(&*core);
+            let Ok(mut rtt) = Rtt::attach_region(core, &target, &ScanRegion::Exact(self.addr))
+            else {
                 return Ok(()); // Not initialized yet; try again next poll.
             };
             // Block rather than drop while the host is reading: a test that

@@ -38,6 +38,11 @@ cargo build --release --no-default-features
 
 The server speaks MCP over stdio.
 
+The probe-rs crates are pinned to revision `3aa37d88e` of
+[okhsunrog/probe-rs](https://github.com/okhsunrog/probe-rs/tree/fix/jtagprobe-bl706).
+This revision supports JTAGprobe and BL702/BL704/BL706 debug sessions. BL70x
+flash programming is not implemented; RTT can attach to firmware loaded into RAM.
+
 ## Configure your MCP client
 
 ```sh
