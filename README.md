@@ -38,11 +38,14 @@ cargo build --release --no-default-features
 
 The server speaks MCP over stdio.
 
-The probe-rs crates are pinned to revision `b6976df6e` of
+The probe-rs crates are pinned to revision `4884829b5` of
 [okhsunrog/probe-rs](https://github.com/okhsunrog/probe-rs/tree/fix/jtagprobe-bl706).
 This revision supports JTAGprobe and BL702/BL704/BL706 debug sessions, using CPU
-program-buffer access for GLB registers to avoid stalled System Bus reads. BL70x
-flash programming is not implemented; RTT can attach to firmware loaded into RAM.
+program-buffer access for GLB registers to avoid stalled System Bus reads. BL706
+embedded Macronix 1 MiB flash programming/readback and ROM boot are supported.
+Flash/rerun capture preserves the ELF loader's RAM-versus-flash boot decision.
+BL702/BL704 remain debug-only. A BL706 flash ELF must already contain a valid boot
+header; the `bl706-embassy` Cargo runner prepares `heartbeat.flash.elf` for this.
 
 ## Configure your MCP client
 

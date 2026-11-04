@@ -10,8 +10,8 @@ use super::stacktrace::StackTracer;
 use crate::capture::ByteSource;
 use probe_rs::config::{DebugSequence, MemoryRegion, Registry, Target};
 use probe_rs::flashing::{
-    ElfLoader, ElfOptions, FlashError, FlashProgress, ImageLoader, build_loader, download_file,
-    erase, erase_all,
+    BootInfo, ElfLoader, ElfOptions, FlashError, FlashProgress, ImageLoader, build_loader,
+    download_file, erase, erase_all,
 };
 use probe_rs::probe::list::Lister;
 use probe_rs::probe::{DebugProbeInfo, WireProtocol};
@@ -424,8 +424,42 @@ fn rtt_failure_cause(
 /// Download then reset-and-run so the firmware executes (no monitoring).
 pub fn flash(session: &mut Session, path: &str, chip: &str) -> Result<String, String> {
     let summary = download(session, path, chip)?;
-    reset(session)?;
+    prepare_image(session, Some(path))?;
+    session
+        .core(0)
+        .map_err(|e| e.to_string())?
+        .run()
+        .map_err(|e| e.to_string())?;
     Ok(summary)
+}
+
+/// Preserve the image loader's RAM/flash boot decision when starting firmware.
+fn prepare_image(session: &mut Session, path: Option<&str>) -> Result<(), String> {
+    let boot = if let Some(path) = path {
+        let format = format_for_chip(&session.target().name);
+        build_loader(session, path, format, None)
+            .map_err(|e| format!("Cannot prepare '{path}': {e}"))?
+            .boot_info()
+    } else {
+        BootInfo::Other
+    };
+    match boot {
+        BootInfo::FromRam {
+            vector_table_addr, ..
+        } => {
+            session
+                .core(0)
+                .map_err(|e| e.to_string())?
+                .reset_and_halt(Duration::from_millis(500))
+                .map_err(|e| e.to_string())?;
+            session
+                .prepare_running_on_ram(vector_table_addr, 0)
+                .map_err(|e| e.to_string())
+        }
+        BootInfo::Other => session
+            .prepare_running_on_flash(0)
+            .map_err(|e| e.to_string()),
+    }
 }
 
 /// Reset-and-run the firmware (probe-rs equivalent of a DTR/RTS reset).
@@ -473,12 +507,11 @@ pub fn reset_and_attach_rtt(
         None => ScanRegion::Ram,
     };
 
+    prepare_image(&mut session, elf_path)?;
     {
         let mut core = session
             .core(0)
             .map_err(|e| format!("Failed to access core: {e}"))?;
-        core.reset_and_halt(Duration::from_millis(500))
-            .map_err(|e| format!("Failed to reset-and-halt: {e}"))?;
         // Invalidate a stale control block (magic + pointers from the previous
         // run) so the poll loop below can't latch onto it before the firmware
         // re-initializes RTT with a fresh read pointer at 0.

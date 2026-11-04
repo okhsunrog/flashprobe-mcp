@@ -315,8 +315,8 @@ impl RttLog {
 
 /// Reset into a fresh run, with the old RTT control block cleared first.
 fn restart(session: &mut Session, rtt: Option<&mut RttLog>) -> Result<()> {
+    session.prepare_running_on_flash(0)?;
     let mut core = session.core(0)?;
-    core.reset_and_halt(Duration::from_millis(500))?;
     if let Some(rtt) = rtt {
         rtt.invalidate(&mut core)?;
     }
