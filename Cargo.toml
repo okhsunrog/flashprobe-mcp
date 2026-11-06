@@ -11,9 +11,9 @@ defmt-parser = "1.0"
 espflash = { version = "4.7.0", default-features = false, features = ["serialport"] }
 md5 = "0.8"
 object = { version = "0.40.0", features = ["read"], optional = true, package = "object" }
-probe-rs = { version = "0.32.0", optional = true, git = "https://github.com/okhsunrog/probe-rs", rev = "4884829b503b29a3519c1e424402a6c4ec437d95" }
-probe-rs-debug = { version = "0.32.0", optional = true, git = "https://github.com/okhsunrog/probe-rs", rev = "4884829b503b29a3519c1e424402a6c4ec437d95" }
-probe-rs-espressif = { version = "0.32.0", optional = true, git = "https://github.com/okhsunrog/probe-rs", rev = "4884829b503b29a3519c1e424402a6c4ec437d95" }
+probe-rs = { version = "0.32.0", optional = true, git = "https://github.com/okhsunrog/probe-rs", rev = "0133f9bbe84964e29f21e33a1864c2ff30cf4b15" }
+probe-rs-debug = { version = "0.32.0", optional = true, git = "https://github.com/okhsunrog/probe-rs", rev = "0133f9bbe84964e29f21e33a1864c2ff30cf4b15" }
+probe-rs-espressif = { version = "0.32.0", optional = true, git = "https://github.com/okhsunrog/probe-rs", rev = "0133f9bbe84964e29f21e33a1864c2ff30cf4b15" }
 regex = "1.13.1"
 rmcp = { version = "3.1.3", features = ["server", "transport-io"] }
 serde = { version = "1.0.229", features = ["derive"] }

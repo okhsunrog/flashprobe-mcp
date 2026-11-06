@@ -1595,7 +1595,7 @@ checksum = "439ee305def115ba05938db6eb1644ff94165c5ab5e9420d1c1bcedbba909391"
 [[package]]
 name = "probe-rs"
 version = "0.32.0"
-source = "git+https://github.com/okhsunrog/probe-rs?rev=4884829b503b29a3519c1e424402a6c4ec437d95#4884829b503b29a3519c1e424402a6c4ec437d95"
+source = "git+https://github.com/okhsunrog/probe-rs?rev=0133f9bbe84964e29f21e33a1864c2ff30cf4b15#0133f9bbe84964e29f21e33a1864c2ff30cf4b15"
 dependencies = [
  "anyhow",
  "bincode",
@@ -1629,7 +1629,7 @@ dependencies = [
 [[package]]
 name = "probe-rs-debug"
 version = "0.32.0"
-source = "git+https://github.com/okhsunrog/probe-rs?rev=4884829b503b29a3519c1e424402a6c4ec437d95#4884829b503b29a3519c1e424402a6c4ec437d95"
+source = "git+https://github.com/okhsunrog/probe-rs?rev=0133f9bbe84964e29f21e33a1864c2ff30cf4b15#0133f9bbe84964e29f21e33a1864c2ff30cf4b15"
 dependencies = [
  "addr2line",
  "bitfield",
@@ -1648,7 +1648,7 @@ dependencies = [
 [[package]]
 name = "probe-rs-espressif"
 version = "0.32.0"
-source = "git+https://github.com/okhsunrog/probe-rs?rev=4884829b503b29a3519c1e424402a6c4ec437d95#4884829b503b29a3519c1e424402a6c4ec437d95"
+source = "git+https://github.com/okhsunrog/probe-rs?rev=0133f9bbe84964e29f21e33a1864c2ff30cf4b15#0133f9bbe84964e29f21e33a1864c2ff30cf4b15"
 dependencies = [
  "bincode",
  "bitvec",
@@ -1666,7 +1666,7 @@ dependencies = [
 [[package]]
 name = "probe-rs-target"
 version = "0.32.0"
-source = "git+https://github.com/okhsunrog/probe-rs?rev=4884829b503b29a3519c1e424402a6c4ec437d95#4884829b503b29a3519c1e424402a6c4ec437d95"
+source = "git+https://github.com/okhsunrog/probe-rs?rev=0133f9bbe84964e29f21e33a1864c2ff30cf4b15#0133f9bbe84964e29f21e33a1864c2ff30cf4b15"
 dependencies = [
  "base64 0.23.1",
  "bincode",
